@@ -10,6 +10,17 @@ async fn main() {
     info!("JaIM - Japanese AI-powered Input Method");
     info!("Starting JaIM engine...");
 
-    // TODO: Initialize core components
-    // TODO: Start IBus engine service
+    match ibus::start_ibus_service().await {
+        Ok(connection) => {
+            info!("JaIM: IBus service started successfully");
+            // Keep the connection alive
+            loop {
+                connection.monitor_activity().await;
+            }
+        }
+        Err(e) => {
+            eprintln!("JaIM: Failed to start IBus service: {}", e);
+            std::process::exit(1);
+        }
+    }
 }

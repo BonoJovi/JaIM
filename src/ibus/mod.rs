@@ -3,11 +3,14 @@
 //! Implements the org.freedesktop.IBus.Engine D-Bus interface
 //! using the zbus crate for pure-Rust D-Bus communication.
 //!
-//! Handles:
-//! - Key event interception (ProcessKeyEvent)
-//! - Preedit text display (UpdatePreeditText)
-//! - Candidate list display (UpdateLookupTable)
-//! - Text commit (CommitText)
-//! - Focus/reset lifecycle
+//! Architecture:
+//! - JaimEngine: implements org.freedesktop.IBus.Engine (key events, preedit, commit)
+//! - JaimFactory: implements org.freedesktop.IBus.Factory (engine creation)
+//! - Component XML: registration file for IBus daemon
 
-// TODO: Implement IBus D-Bus interface via zbus
+mod engine_impl;
+mod factory;
+pub mod keymap;
+
+pub use engine_impl::JaimEngine;
+pub use factory::start_ibus_service;

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component>
+  <name>org.freedesktop.IBus.JaIM</name>
+  <description>JaIM - Japanese AI-powered Input Method</description>
+  <exec>/usr/lib/ibus/ibus-engine-jaim</exec>
+  <version>0.1.0</version>
+  <author>Yoshihiro NAKAHARA</author>
+  <license>MIT</license>
+  <homepage>https://github.com/BonoJovi/JaIM</homepage>
+  <textdomain>jaim</textdomain>
+  <engines>
+    <engine>
+      <name>jaim</name>
+      <longname>JaIM - Japanese AI Input</longname>
+      <description>LLM-powered intelligent Japanese input method</description>
+      <language>ja</language>
+      <license>MIT</license>
+      <author>Yoshihiro NAKAHARA</author>
+      <icon></icon>
+      <layout>default</layout>
+      <rank>80</rank>
+    </engine>
+  </engines>
+</component>
