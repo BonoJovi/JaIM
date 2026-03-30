@@ -8,9 +8,9 @@
 //! - JaimFactory: implements org.freedesktop.IBus.Factory (engine creation)
 //! - Component XML: registration file for IBus daemon
 
+mod config;
 mod engine_impl;
 mod factory;
 pub mod keymap;
 
-pub use engine_impl::JaimEngine;
 pub use factory::start_ibus_service;

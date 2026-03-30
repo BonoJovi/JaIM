@@ -11,9 +11,6 @@ use romaji_table::ROMAJI_TABLE;
 pub struct RomajiConverter {
     buffer: String,
     output: String,
-    /// When true, the 'n' in buffer was produced by double-n;
-    /// flush should NOT emit another ん
-    n_from_double: bool,
 }
 
 impl RomajiConverter {
@@ -21,16 +18,11 @@ impl RomajiConverter {
         Self {
             buffer: String::new(),
             output: String::new(),
-            n_from_double: false,
         }
     }
 
     /// Process a single key input and return converted kana (if any)
     pub fn process_key(&mut self, key: char) -> Option<String> {
-        // If the pending 'n' from double-n gets a new char, it's a real 'n' start
-        if self.n_from_double && key != 'n' {
-            self.n_from_double = false;
-        }
         self.buffer.push(key);
         self.try_convert()
     }
@@ -58,15 +50,20 @@ impl RomajiConverter {
             if bytes[0] == bytes[1] && is_doubling_consonant(bytes[0] as char) {
                 let geminate = if bytes[0] == b'n' { "ん" } else { "っ" };
                 let is_nn = bytes[0] == b'n';
-                let rest = self.buffer[1..].to_string();
-                self.buffer = rest;
                 self.output.push_str(geminate);
                 if is_nn {
-                    self.n_from_double = true;
+                    // "nn" → "ん", clear buffer entirely (Mozc-style)
+                    self.buffer.clear();
+                } else {
+                    // "kk" → "っ", keep second consonant for next syllable
+                    let rest = self.buffer[1..].to_string();
+                    self.buffer = rest;
                 }
 
-                if let Some(more_kana) = self.try_convert() {
-                    return Some(format!("{}{}", geminate, more_kana));
+                if !self.buffer.is_empty() {
+                    if let Some(more_kana) = self.try_convert() {
+                        return Some(format!("{}{}", geminate, more_kana));
+                    }
                 }
                 return Some(geminate.to_string());
             }
@@ -105,12 +102,6 @@ impl RomajiConverter {
     /// Flush remaining buffer (call on space/enter/commit)
     pub fn flush(&mut self) -> Option<String> {
         if self.buffer == "n" {
-            if self.n_from_double {
-                // "nn" already emitted ん; discard the pending n
-                self.buffer.clear();
-                self.n_from_double = false;
-                return None;
-            }
             self.buffer.clear();
             self.output.push('ん');
             return Some("ん".to_string());
@@ -118,7 +109,6 @@ impl RomajiConverter {
         if !self.buffer.is_empty() {
             self.buffer.clear();
         }
-        self.n_from_double = false;
         None
     }
 
@@ -126,7 +116,6 @@ impl RomajiConverter {
     pub fn reset(&mut self) {
         self.buffer.clear();
         self.output.clear();
-        self.n_from_double = false;
     }
 
     /// Get current romaji buffer (incomplete input)
@@ -134,10 +123,134 @@ impl RomajiConverter {
         &self.buffer
     }
 
+    /// Delete the last character from the buffer or output.
+    /// Returns true if something was deleted, false if empty.
+    pub fn delete_last(&mut self) -> bool {
+        if !self.buffer.is_empty() {
+            self.buffer.pop();
+            true
+        } else if !self.output.is_empty() {
+            self.output.pop();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Append a raw string directly to the output (bypassing romaji conversion).
+    pub fn append_raw(&mut self, s: &str) {
+        self.output.push_str(s);
+    }
+
     /// Get accumulated kana output
     pub fn output(&self) -> &str {
         &self.output
     }
+}
+
+/// Convert a hiragana string to full-width katakana.
+/// Non-hiragana characters (ー, kanji, etc.) are left unchanged.
+pub fn hiragana_to_katakana(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if ('\u{3041}'..='\u{3096}').contains(&c) {
+                // Hiragana (ぁ-ゖ) → Katakana (ァ-ヶ): offset +0x60
+                char::from_u32(c as u32 + 0x60).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Convert a hiragana string to half-width katakana.
+/// Dakuten/handakuten are decomposed into separate characters.
+pub fn hiragana_to_halfwidth_katakana(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            'あ' => result.push('ｱ'), 'い' => result.push('ｲ'), 'う' => result.push('ｳ'),
+            'え' => result.push('ｴ'), 'お' => result.push('ｵ'),
+            'か' => result.push('ｶ'), 'き' => result.push('ｷ'), 'く' => result.push('ｸ'),
+            'け' => result.push('ｹ'), 'こ' => result.push('ｺ'),
+            'さ' => result.push('ｻ'), 'し' => result.push('ｼ'), 'す' => result.push('ｽ'),
+            'せ' => result.push('ｾ'), 'そ' => result.push('ｿ'),
+            'た' => result.push('ﾀ'), 'ち' => result.push('ﾁ'), 'つ' => result.push('ﾂ'),
+            'て' => result.push('ﾃ'), 'と' => result.push('ﾄ'),
+            'な' => result.push('ﾅ'), 'に' => result.push('ﾆ'), 'ぬ' => result.push('ﾇ'),
+            'ね' => result.push('ﾈ'), 'の' => result.push('ﾉ'),
+            'は' => result.push('ﾊ'), 'ひ' => result.push('ﾋ'), 'ふ' => result.push('ﾌ'),
+            'へ' => result.push('ﾍ'), 'ほ' => result.push('ﾎ'),
+            'ま' => result.push('ﾏ'), 'み' => result.push('ﾐ'), 'む' => result.push('ﾑ'),
+            'め' => result.push('ﾒ'), 'も' => result.push('ﾓ'),
+            'や' => result.push('ﾔ'), 'ゆ' => result.push('ﾕ'), 'よ' => result.push('ﾖ'),
+            'ら' => result.push('ﾗ'), 'り' => result.push('ﾘ'), 'る' => result.push('ﾙ'),
+            'れ' => result.push('ﾚ'), 'ろ' => result.push('ﾛ'),
+            'わ' => result.push('ﾜ'), 'を' => result.push('ｦ'), 'ん' => result.push('ﾝ'),
+            // Dakuten (voiced): base + ﾞ
+            'が' => { result.push('ｶ'); result.push('ﾞ'); }
+            'ぎ' => { result.push('ｷ'); result.push('ﾞ'); }
+            'ぐ' => { result.push('ｸ'); result.push('ﾞ'); }
+            'げ' => { result.push('ｹ'); result.push('ﾞ'); }
+            'ご' => { result.push('ｺ'); result.push('ﾞ'); }
+            'ざ' => { result.push('ｻ'); result.push('ﾞ'); }
+            'じ' => { result.push('ｼ'); result.push('ﾞ'); }
+            'ず' => { result.push('ｽ'); result.push('ﾞ'); }
+            'ぜ' => { result.push('ｾ'); result.push('ﾞ'); }
+            'ぞ' => { result.push('ｿ'); result.push('ﾞ'); }
+            'だ' => { result.push('ﾀ'); result.push('ﾞ'); }
+            'ぢ' => { result.push('ﾁ'); result.push('ﾞ'); }
+            'づ' => { result.push('ﾂ'); result.push('ﾞ'); }
+            'で' => { result.push('ﾃ'); result.push('ﾞ'); }
+            'ど' => { result.push('ﾄ'); result.push('ﾞ'); }
+            'ば' => { result.push('ﾊ'); result.push('ﾞ'); }
+            'び' => { result.push('ﾋ'); result.push('ﾞ'); }
+            'ぶ' => { result.push('ﾌ'); result.push('ﾞ'); }
+            'べ' => { result.push('ﾍ'); result.push('ﾞ'); }
+            'ぼ' => { result.push('ﾎ'); result.push('ﾞ'); }
+            'ゔ' => { result.push('ｳ'); result.push('ﾞ'); }
+            // Handakuten (p-sounds): base + ﾟ
+            'ぱ' => { result.push('ﾊ'); result.push('ﾟ'); }
+            'ぴ' => { result.push('ﾋ'); result.push('ﾟ'); }
+            'ぷ' => { result.push('ﾌ'); result.push('ﾟ'); }
+            'ぺ' => { result.push('ﾍ'); result.push('ﾟ'); }
+            'ぽ' => { result.push('ﾎ'); result.push('ﾟ'); }
+            // Small kana
+            'ぁ' => result.push('ｧ'), 'ぃ' => result.push('ｨ'), 'ぅ' => result.push('ｩ'),
+            'ぇ' => result.push('ｪ'), 'ぉ' => result.push('ｫ'),
+            'っ' => result.push('ｯ'),
+            'ゃ' => result.push('ｬ'), 'ゅ' => result.push('ｭ'), 'ょ' => result.push('ｮ'),
+            // Long vowel mark
+            'ー' => result.push('ｰ'),
+            // Punctuation and symbols (full-width → half-width)
+            '。' => result.push('｡'), '、' => result.push('､'),
+            '「' => result.push('｢'), '」' => result.push('｣'),
+            '・' => result.push('･'),
+            '！' => result.push('!'), '？' => result.push('?'),
+            '（' => result.push('('), '）' => result.push(')'),
+            '｛' => result.push('{'), '｝' => result.push('}'),
+            '［' => result.push('['), '］' => result.push(']'),
+            '＋' => result.push('+'), '－' => result.push('-'),
+            '＝' => result.push('='), '＊' => result.push('*'),
+            '／' => result.push('/'), '＼' => result.push('\\'),
+            '＆' => result.push('&'), '＠' => result.push('@'),
+            '＃' => result.push('#'), '＄' => result.push('$'),
+            '％' => result.push('%'), '＾' => result.push('^'),
+            '｜' => result.push('|'), '～' => result.push('~'),
+            '＜' => result.push('<'), '＞' => result.push('>'),
+            '：' => result.push(':'), '；' => result.push(';'),
+            '＿' => result.push('_'), '＂' => result.push('"'),
+            '＇' => result.push('\''),
+            // Full-width digits → half-width
+            '０'..='９' => result.push((c as u32 - '０' as u32 + '0' as u32) as u8 as char),
+            // Full-width ASCII letters → half-width
+            'Ａ'..='Ｚ' => result.push((c as u32 - 'Ａ' as u32 + 'A' as u32) as u8 as char),
+            'ａ'..='ｚ' => result.push((c as u32 - 'ａ' as u32 + 'a' as u32) as u8 as char),
+            // Pass through anything else unchanged
+            _ => result.push(c),
+        }
+    }
+    result
 }
 
 fn exact_lookup(s: &str) -> Option<&'static str> {
@@ -300,7 +413,10 @@ mod tests {
 
     #[test]
     fn word_konnichiwa() {
-        assert_eq!(convert("konnichiwa"), "こんにちわ");
+        // "nn" clears buffer (Mozc-style): "konnichiwa" → "こんいちわ"
+        // To type "こんにちわ", use "konnnichiwa" (3 n's)
+        assert_eq!(convert("konnichiwa"), "こんいちわ");
+        assert_eq!(convert("konnnichiwa"), "こんにちわ");
     }
 
     #[test]
@@ -325,5 +441,50 @@ mod tests {
     #[test]
     fn wo_particle() {
         assert_eq!(convert("wo"), "を");
+    }
+
+    #[test]
+    fn hiragana_to_katakana_basic() {
+        assert_eq!(hiragana_to_katakana("ぷろんぷと"), "プロンプト");
+    }
+
+    #[test]
+    fn hiragana_to_katakana_mixed() {
+        // Long vowel mark and non-hiragana pass through unchanged
+        assert_eq!(hiragana_to_katakana("こーひー"), "コーヒー");
+        assert_eq!(hiragana_to_katakana("あ"), "ア");
+    }
+
+    #[test]
+    fn hiragana_to_katakana_empty() {
+        assert_eq!(hiragana_to_katakana(""), "");
+    }
+
+    #[test]
+    fn halfwidth_katakana_basic() {
+        assert_eq!(hiragana_to_halfwidth_katakana("ぷろんぷと"), "ﾌﾟﾛﾝﾌﾟﾄ");
+    }
+
+    #[test]
+    fn halfwidth_katakana_dakuten() {
+        assert_eq!(hiragana_to_halfwidth_katakana("がぎぐげご"), "ｶﾞｷﾞｸﾞｹﾞｺﾞ");
+        assert_eq!(hiragana_to_halfwidth_katakana("ぱぴぷぺぽ"), "ﾊﾟﾋﾟﾌﾟﾍﾟﾎﾟ");
+    }
+
+    #[test]
+    fn halfwidth_katakana_small() {
+        assert_eq!(hiragana_to_halfwidth_katakana("っ"), "ｯ");
+        assert_eq!(hiragana_to_halfwidth_katakana("ゃゅょ"), "ｬｭｮ");
+    }
+
+    #[test]
+    fn halfwidth_katakana_punctuation() {
+        assert_eq!(hiragana_to_halfwidth_katakana("。、"), "｡､");
+    }
+
+    #[test]
+    fn halfwidth_symbols() {
+        assert_eq!(hiragana_to_halfwidth_katakana("！？"), "!?");
+        assert_eq!(hiragana_to_halfwidth_katakana("（）"), "()");
     }
 }

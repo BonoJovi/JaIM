@@ -5,12 +5,14 @@
 /// preedit/commit/candidates back via D-Bus signals.
 use std::sync::Mutex;
 
-use log::{debug, info};
+use log::{debug, info, warn};
 use zbus::object_server::SignalEmitter;
 use zbus::{interface, zvariant};
 
-use crate::engine::ConversionEngine;
+use crate::core::dictionary::Dictionary;
+use crate::engine::{ConversionEngine, ConversionState};
 
+use super::config::{CompiledToggleKey, JaimConfig};
 use super::keymap::*;
 
 /// IBus Engine state
@@ -20,36 +22,161 @@ pub struct JaimEngine {
     enabled: Mutex<bool>,
     /// Whether we are in conversion mode (showing candidates)
     converting: Mutex<bool>,
-    /// Current candidate list
-    candidates: Mutex<Vec<String>>,
-    /// Selected candidate index
-    selected: Mutex<usize>,
+    /// Compiled toggle key bindings (immutable after creation)
+    toggle_keys: Vec<CompiledToggleKey>,
 }
 
 impl JaimEngine {
-    pub fn new() -> Self {
+    pub fn new(config: &JaimConfig) -> Self {
+        let toggle_keys = config.compile_toggle_keys();
+        info!(
+            "JaIM: Engine created with {} toggle key binding(s)",
+            toggle_keys.len()
+        );
         Self {
             engine: Mutex::new(ConversionEngine::new()),
             enabled: Mutex::new(false),
             converting: Mutex::new(false),
-            candidates: Mutex::new(Vec::new()),
-            selected: Mutex::new(0),
+            toggle_keys,
         }
     }
 }
 
-/// Helper to build an IBus text variant (a{sv} dict with "s" key).
-/// IBus expects text as a GVariant struct: (sa{sv}sv)
-/// Simplified: we send a plain string wrapped in IBusText structure.
-fn ibus_text(text: &str) -> zvariant::Value<'static> {
-    // IBusText is serialized as: ("IBusText", {}, text, {})
-    // But for CommitText/UpdatePreeditText, the daemon accepts
-    // a simpler tuple format depending on the IBus version.
-    // Using the struct format: (name, attachments, text, attributes)
+/// Empty attachments dict reused by all IBus serializable builders.
+fn ibus_attachments() -> std::collections::HashMap<String, zvariant::Value<'static>> {
+    std::collections::HashMap::new()
+}
+
+/// Build an IBusAttrList: ("IBusAttrList", {attachments}, av[])
+fn ibus_attr_list() -> zvariant::Value<'static> {
     zvariant::Value::new(zvariant::Structure::from((
-        "IBusText",                                          // type name
-        std::collections::HashMap::<String, String>::new(),  // attachments
-        text.to_string(),                                    // the actual text
+        "IBusAttrList",
+        ibus_attachments(),
+        Vec::<zvariant::Value>::new(),
+    )))
+}
+
+/// Build an IBusText: ("IBusText", {attachments}, text, v(IBusAttrList))
+fn ibus_text(text: &str) -> zvariant::Value<'static> {
+    zvariant::Value::new(zvariant::Structure::from((
+        "IBusText",
+        ibus_attachments(),
+        text.to_string(),
+        ibus_attr_list(),
+    )))
+}
+
+/// Build an IBusText with custom attributes.
+fn ibus_text_with_attrs(text: &str, attrs: Vec<zvariant::Value<'static>>) -> zvariant::Value<'static> {
+    zvariant::Value::new(zvariant::Structure::from((
+        "IBusText",
+        ibus_attachments(),
+        text.to_string(),
+        ibus_attr_list_with(attrs),
+    )))
+}
+
+/// Build an IBusPropList: ("IBusPropList", {attachments}, av[properties])
+fn ibus_prop_list(props: Vec<zvariant::Value<'static>>) -> zvariant::Value<'static> {
+    zvariant::Value::new(zvariant::Structure::from((
+        "IBusPropList",
+        ibus_attachments(),
+        props,
+    )))
+}
+
+/// Build an IBusProperty:
+/// ("IBusProperty", {attachments}, key, type, v(label), icon, v(tooltip),
+///  sensitive, visible, state, v(sub_props))
+fn ibus_property(
+    key: &str,
+    prop_type: u32,
+    label: &str,
+    icon: &str,
+    tooltip: &str,
+) -> zvariant::Value<'static> {
+    zvariant::Value::new(zvariant::Structure::from((
+        "IBusProperty",
+        ibus_attachments(),
+        key.to_string(),           // key (s)
+        prop_type,                 // type (u)
+        ibus_text(label),          // label (v → IBusText)
+        icon.to_string(),          // icon (s)
+        ibus_text(tooltip),        // tooltip (v → IBusText)
+        true,                      // sensitive (b)
+        true,                      // visible (b)
+        0u32,                      // state (u)
+        ibus_prop_list(vec![]),    // sub_props (v → IBusPropList)
+        ibus_text(""),             // symbol (v → IBusText)
+    )))
+}
+
+/// Build an IBusAttribute: ("IBusAttribute", {attachments}, type, value, start, end)
+/// type: 1=underline, 2=foreground, 3=background
+/// underline values: 0=none, 1=single, 2=double, 3=low
+fn ibus_attribute(attr_type: u32, value: u32, start: u32, end: u32) -> zvariant::Value<'static> {
+    zvariant::Value::new(zvariant::Structure::from((
+        "IBusAttribute",
+        ibus_attachments(),
+        attr_type,
+        value,
+        start,
+        end,
+    )))
+}
+
+/// Build an IBusAttrList with the given attributes.
+fn ibus_attr_list_with(attrs: Vec<zvariant::Value<'static>>) -> zvariant::Value<'static> {
+    zvariant::Value::new(zvariant::Structure::from((
+        "IBusAttrList",
+        ibus_attachments(),
+        attrs,
+    )))
+}
+
+/// Build an IBusText with segment highlighting.
+/// All text gets single underline; the focused segment gets double underline.
+fn ibus_text_with_segments(text: &str, ranges: &[(usize, usize)], focus: usize) -> zvariant::Value<'static> {
+    let total_chars = text.chars().count() as u32;
+    let mut attrs = Vec::new();
+
+    // Single underline for entire text
+    attrs.push(ibus_attribute(1, 1, 0, total_chars));
+
+    // Double underline for focused segment
+    if let Some(&(start, end)) = ranges.get(focus) {
+        attrs.push(ibus_attribute(1, 2, start as u32, end as u32));
+    }
+
+    zvariant::Value::new(zvariant::Structure::from((
+        "IBusText",
+        ibus_attachments(),
+        text.to_string(),
+        ibus_attr_list_with(attrs),
+    )))
+}
+
+/// Build an IBusLookupTable:
+/// ("IBusLookupTable", {attachments}, page_size, cursor_pos, cursor_visible,
+///  round, orientation, candidates[], labels[])
+fn ibus_lookup_table(candidates: &[String], selected: usize) -> zvariant::Value<'static> {
+    let candidate_values: Vec<zvariant::Value> = candidates
+        .iter()
+        .map(|c| ibus_text(c))
+        .collect();
+    let labels: Vec<zvariant::Value> = (0..candidates.len())
+        .map(|i| ibus_text(&format!("{}.", i + 1)))
+        .collect();
+    zvariant::Value::new(zvariant::Structure::from((
+        "IBusLookupTable",
+        ibus_attachments(),
+        9u32,                    // page_size
+        selected as u32,         // cursor_pos
+        true,                    // cursor_visible
+        true,                    // round
+        1i32,                    // orientation: 0=horizontal, 1=vertical
+        candidate_values,        // candidates
+        labels,                  // labels
     )))
 }
 
@@ -68,6 +195,25 @@ impl JaimEngine {
             return Ok(false);
         }
 
+        debug!(
+            "JaIM: KeyEvent keyval=0x{:04X} keycode={} state=0x{:08X}",
+            keyval, _keycode, state
+        );
+
+        // Toggle key check — must come before modifier pass-through
+        if self.is_toggle_key(keyval, state) {
+            let was_enabled = *self.enabled.lock().unwrap();
+            if was_enabled {
+                let _ = self.cancel_input(&emitter).await;
+                *self.enabled.lock().unwrap() = false;
+            } else {
+                *self.enabled.lock().unwrap() = true;
+            }
+            let now = *self.enabled.lock().unwrap();
+            info!("JaIM: Toggle → enabled={}", now);
+            return Ok(true);
+        }
+
         // Pass through modifier combos (Ctrl+C, Alt+Tab, etc.)
         if has_modifier(state) {
             return Ok(false);
@@ -80,9 +226,38 @@ impl JaimEngine {
 
         let converting = *self.converting.lock().unwrap();
 
+        // F6 → hiragana
+        if keyval == IBUS_KEY_F6 {
+            if converting {
+                let conv = {
+                    let mut engine = self.engine.lock().unwrap();
+                    engine.convert_focused_to_hiragana().cloned()
+                };
+                if let Some(conv) = conv {
+                    self.show_conversion_state(&emitter, &conv).await?;
+                }
+                return Ok(true);
+            } else {
+                // Enter kana conversion mode with hiragana selected
+                return self.start_kana_conversion(&emitter, 0).await;
+            }
+        }
+
+        // F7 → full-width katakana, F8 → half-width katakana
+        if keyval == IBUS_KEY_F7 || keyval == IBUS_KEY_F8 {
+            let form = if keyval == IBUS_KEY_F8 { 2 } else { 1 };
+            if converting {
+                let half = keyval == IBUS_KEY_F8;
+                return self.convert_focused_to_kana(&emitter, half).await;
+            } else {
+                // Enter kana conversion mode with katakana/half-width selected
+                return self.start_kana_conversion(&emitter, form).await;
+            }
+        }
+
         // Handle special keys during conversion mode
         if converting {
-            return self.handle_conversion_key(&emitter, keyval).await;
+            return self.handle_conversion_key(&emitter, keyval, state).await;
         }
 
         // Space → trigger conversion
@@ -105,6 +280,60 @@ impl JaimEngine {
             return self.handle_backspace(&emitter).await;
         }
 
+        // Arrow keys / navigation keys → consume if preedit is active to prevent
+        // interference (e.g. Shift+Arrow inserting stray characters), pass through otherwise
+        if matches!(keyval, IBUS_KEY_LEFT | IBUS_KEY_RIGHT | IBUS_KEY_UP | IBUS_KEY_DOWN
+                          | IBUS_KEY_PAGE_UP | IBUS_KEY_PAGE_DOWN) {
+            let has_preedit = !self.engine.lock().unwrap().preedit().is_empty();
+            return Ok(has_preedit);
+        }
+
+        // Symbol/punctuation → full-width equivalent in preedit (F8 for half-width)
+        if let Some(ch) = keyval_to_char(keyval) {
+            let fw = match ch {
+                ',' => Some("、"),
+                '.' => Some("。"),
+                '!' => Some("！"),
+                '?' => Some("？"),
+                '(' => Some("（"),
+                ')' => Some("）"),
+                '[' => Some("［"),
+                ']' => Some("］"),
+                '{' => Some("｛"),
+                '}' => Some("｝"),
+                '+' => Some("＋"),
+                '=' => Some("＝"),
+                '*' => Some("＊"),
+                '/' => Some("／"),
+                '\\' => Some("＼"),
+                '&' => Some("＆"),
+                '@' => Some("＠"),
+                '#' => Some("＃"),
+                '$' => Some("＄"),
+                '%' => Some("％"),
+                '^' => Some("＾"),
+                '|' => Some("｜"),
+                '~' => Some("～"),
+                '<' => Some("＜"),
+                '>' => Some("＞"),
+                ':' => Some("："),
+                ';' => Some("；"),
+                '_' => Some("＿"),
+                '"' => Some("＂"),
+                '`' => Some("｀"),
+                _ => None,
+            };
+            if let Some(sym) = fw {
+                let preedit = {
+                    let mut engine = self.engine.lock().unwrap();
+                    engine.append_raw(sym);
+                    engine.preedit().to_string()
+                };
+                self.send_preedit(&emitter, &preedit).await?;
+                return Ok(true);
+            }
+        }
+
         // Printable ASCII → feed to romaji converter
         if let Some(ch) = keyval_to_char(keyval) {
             if ch.is_ascii_alphabetic() || ch == '-' || ch == '\'' {
@@ -124,9 +353,33 @@ impl JaimEngine {
     }
 
     /// Called when the engine gains focus.
-    async fn focus_in(&self) {
+    async fn focus_in(
+        &self,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+    ) {
         info!("JaIM: FocusIn");
         *self.enabled.lock().unwrap() = true;
+        if let Err(e) = self.register_menu(&emitter).await {
+            warn!("JaIM: Failed to register properties: {}", e);
+        }
+    }
+
+    /// Called when a menu item is activated.
+    async fn property_activate(&self, prop_name: &str, _state: u32) {
+        info!("JaIM: PropertyActivate({})", prop_name);
+        match prop_name {
+            "jaim-export" => {
+                std::thread::spawn(|| {
+                    Self::run_dict_export();
+                });
+            }
+            "jaim-import" => {
+                std::thread::spawn(|| {
+                    Self::run_dict_import();
+                });
+            }
+            _ => {}
+        }
     }
 
     /// Called when the engine loses focus.
@@ -178,12 +431,14 @@ impl JaimEngine {
         -> zbus::Result<()>;
 
     /// Update preedit text displayed in the input area.
+    /// mode: 0 = IBUS_ENGINE_PREEDIT_CLEAR, 1 = IBUS_ENGINE_PREEDIT_COMMIT
     #[zbus(signal)]
     async fn update_preedit_text(
         emitter: &SignalEmitter<'_>,
         text: zvariant::Value<'_>,
         cursor_pos: u32,
         visible: bool,
+        mode: u32,
     ) -> zbus::Result<()>;
 
     /// Hide preedit text.
@@ -201,33 +456,59 @@ impl JaimEngine {
     /// Hide the lookup table.
     #[zbus(signal)]
     async fn hide_lookup_table(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    /// Register the property list (menu items).
+    #[zbus(signal)]
+    async fn register_properties(
+        emitter: &SignalEmitter<'_>,
+        properties: zvariant::Value<'_>,
+    ) -> zbus::Result<()>;
 }
 
 // Private helper methods (not exposed via D-Bus)
 impl JaimEngine {
+    /// Check if the given key event matches any configured toggle binding.
+    fn is_toggle_key(&self, keyval: u32, state: u32) -> bool {
+        let relevant_mask = IBUS_CONTROL_MASK | IBUS_MOD1_MASK | IBUS_SHIFT_MASK;
+        let active_modifiers = state & relevant_mask;
+        self.toggle_keys
+            .iter()
+            .any(|tk| keyval == tk.keyval && active_modifiers == tk.modifier_mask)
+    }
+
+    /// Start a kana-form conversion (F6/F7/F8 outside conversion mode).
+    /// form: 0 = hiragana, 1 = katakana, 2 = half-width katakana
+    async fn start_kana_conversion(
+        &self,
+        emitter: &SignalEmitter<'_>,
+        form: usize,
+    ) -> zbus::fdo::Result<bool> {
+        let state = {
+            let mut engine = self.engine.lock().unwrap();
+            engine.start_kana_conversion(form).cloned()
+        };
+        let Some(state) = state else {
+            return Ok(false);
+        };
+        self.show_conversion_state(emitter, &state).await?;
+        *self.converting.lock().unwrap() = true;
+        Ok(true)
+    }
+
     async fn start_conversion(
         &self,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
-        let conversion_candidates = {
+        let state = {
             let mut engine = self.engine.lock().unwrap();
-            engine.convert()
+            engine.start_conversion().cloned()
         };
 
-        if conversion_candidates.is_empty() {
+        let Some(state) = state else {
             return Ok(false);
-        }
+        };
 
-        let candidate_texts: Vec<String> =
-            conversion_candidates.iter().map(|c| c.text.clone()).collect();
-
-        // Show the top candidate as preedit
-        let top = &candidate_texts[0];
-        self.send_preedit(emitter, top).await
-            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
-        *self.candidates.lock().unwrap() = candidate_texts;
-        *self.selected.lock().unwrap() = 0;
+        self.show_conversion_state(emitter, &state).await?;
         *self.converting.lock().unwrap() = true;
 
         Ok(true)
@@ -237,68 +518,77 @@ impl JaimEngine {
         &self,
         emitter: &SignalEmitter<'_>,
         keyval: u32,
+        state: u32,
     ) -> zbus::fdo::Result<bool> {
+        let has_shift = state & IBUS_SHIFT_MASK != 0;
+
         match keyval {
-            // Space / Down → next candidate
+            // Space / Down → next candidate for focused segment
             IBUS_KEY_SPACE | IBUS_KEY_DOWN => {
-                let text = {
-                    let candidates = self.candidates.lock().unwrap();
-                    let mut selected = self.selected.lock().unwrap();
-                    if candidates.is_empty() {
-                        None
-                    } else {
-                        *selected = (*selected + 1) % candidates.len();
-                        Some(candidates[*selected].clone())
-                    }
+                let conv = {
+                    let mut engine = self.engine.lock().unwrap();
+                    engine.cycle_candidate(1).cloned()
                 };
-                if let Some(text) = text {
-                    self.send_preedit(emitter, &text).await
-                        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                if let Some(conv) = conv {
+                    self.show_conversion_state(emitter, &conv).await?;
                 }
                 Ok(true)
             }
-            // Up → previous candidate
+            // Up → previous candidate for focused segment
             IBUS_KEY_UP => {
-                let text = {
-                    let candidates = self.candidates.lock().unwrap();
-                    let mut selected = self.selected.lock().unwrap();
-                    if candidates.is_empty() {
-                        None
-                    } else {
-                        *selected = if *selected == 0 {
-                            candidates.len() - 1
-                        } else {
-                            *selected - 1
-                        };
-                        Some(candidates[*selected].clone())
-                    }
+                let conv = {
+                    let mut engine = self.engine.lock().unwrap();
+                    engine.cycle_candidate(-1).cloned()
                 };
-                if let Some(text) = text {
-                    self.send_preedit(emitter, &text).await
-                        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                if let Some(conv) = conv {
+                    self.show_conversion_state(emitter, &conv).await?;
                 }
                 Ok(true)
             }
-            // Enter → commit selected candidate
+            // Right → move focus to next segment (or Shift+Right → extend segment)
+            IBUS_KEY_RIGHT => {
+                let conv = {
+                    let mut engine = self.engine.lock().unwrap();
+                    if has_shift {
+                        engine.resize_segment(1).cloned()
+                    } else {
+                        engine.move_focus(1).cloned()
+                    }
+                };
+                if let Some(conv) = conv {
+                    self.show_conversion_state(emitter, &conv).await?;
+                }
+                Ok(true)
+            }
+            // Left → move focus to previous segment (or Shift+Left → shrink segment)
+            IBUS_KEY_LEFT => {
+                let conv = {
+                    let mut engine = self.engine.lock().unwrap();
+                    if has_shift {
+                        engine.resize_segment(-1).cloned()
+                    } else {
+                        engine.move_focus(-1).cloned()
+                    }
+                };
+                if let Some(conv) = conv {
+                    self.show_conversion_state(emitter, &conv).await?;
+                }
+                Ok(true)
+            }
+            // Enter → commit composed text (with learning)
             IBUS_KEY_RETURN => {
                 let text = {
-                    let candidates = self.candidates.lock().unwrap();
-                    let selected = *self.selected.lock().unwrap();
-                    candidates.get(selected).cloned()
+                    let mut engine = self.engine.lock().unwrap();
+                    engine.commit_conversion()
                 };
                 if let Some(text) = text {
-                    {
-                        let mut engine = self.engine.lock().unwrap();
-                        engine.commit(&text);
-                    }
-
                     Self::commit_text(emitter, ibus_text(&text)).await
                         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
                     Self::hide_preedit_text(emitter).await
                         .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
-
+                    Self::hide_lookup_table(emitter).await
+                        .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
                     *self.converting.lock().unwrap() = false;
-                    *self.candidates.lock().unwrap() = Vec::new();
                 }
                 Ok(true)
             }
@@ -311,13 +601,99 @@ impl JaimEngine {
         }
     }
 
+    /// Show the conversion state: segmented preedit + lookup table for focused segment.
+    async fn show_conversion_state(
+        &self,
+        emitter: &SignalEmitter<'_>,
+        state: &ConversionState,
+    ) -> zbus::fdo::Result<()> {
+        let text = state.composed_text();
+        let ranges = state.segment_char_ranges();
+        let focus = state.focus;
+
+        // Preedit with segment highlighting
+        let cursor = text.chars().count() as u32;
+        Self::update_preedit_text(
+            emitter,
+            ibus_text_with_segments(&text, &ranges, focus),
+            cursor,
+            true,
+            0,
+        ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        // Lookup table for the focused segment's candidates
+        let seg = &state.segments[focus];
+        Self::update_lookup_table(
+            emitter,
+            ibus_lookup_table(&seg.candidates, seg.selected),
+            true,
+        ).await.map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Convert the focused segment to katakana (F7/F8 during conversion mode).
+    async fn convert_focused_to_kana(
+        &self,
+        emitter: &SignalEmitter<'_>,
+        half: bool,
+    ) -> zbus::fdo::Result<bool> {
+        let conv = {
+            let mut engine = self.engine.lock().unwrap();
+            if half {
+                engine.convert_focused_to_halfwidth_katakana().cloned()
+            } else {
+                engine.convert_focused_to_katakana().cloned()
+            }
+        };
+        if let Some(conv) = conv {
+            self.show_conversion_state(emitter, &conv).await?;
+        }
+        Ok(true)
+    }
+
+    /// Convert current preedit to katakana and commit (F7/F8 outside conversion mode).
+    async fn commit_as_kana(
+        &self,
+        emitter: &SignalEmitter<'_>,
+        half: bool,
+    ) -> zbus::fdo::Result<bool> {
+        let converted = {
+            let mut engine = self.engine.lock().unwrap();
+            if half {
+                engine.convert_to_halfwidth_katakana()
+            } else {
+                engine.convert_to_katakana()
+            }
+        };
+        let Some(converted) = converted else {
+            return Ok(false);
+        };
+
+        {
+            let mut engine = self.engine.lock().unwrap();
+            engine.commit(&converted);
+            engine.clear_conversion();
+        }
+
+        Self::commit_text(emitter, ibus_text(&converted)).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::hide_preedit_text(emitter).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::hide_lookup_table(emitter).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+
+        *self.converting.lock().unwrap() = false;
+
+        Ok(true)
+    }
+
     async fn commit_preedit(
         &self,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
         let preedit = {
             let mut engine = self.engine.lock().unwrap();
-            engine.convert();
             let p = engine.preedit().to_string();
             if p.is_empty() {
                 return Ok(false);
@@ -338,10 +714,15 @@ impl JaimEngine {
         &self,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<bool> {
-        self.engine.lock().unwrap().reset();
+        {
+            let mut engine = self.engine.lock().unwrap();
+            engine.reset();
+            engine.clear_conversion();
+        }
         *self.converting.lock().unwrap() = false;
-        *self.candidates.lock().unwrap() = Vec::new();
         Self::hide_preedit_text(emitter).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::hide_lookup_table(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(true)
     }
@@ -350,13 +731,18 @@ impl JaimEngine {
         &self,
         emitter: &SignalEmitter<'_>,
     ) -> zbus::fdo::Result<()> {
+        {
+            let mut engine = self.engine.lock().unwrap();
+            engine.clear_conversion();
+        }
         *self.converting.lock().unwrap() = false;
-        *self.candidates.lock().unwrap() = Vec::new();
         let preedit = {
             let engine = self.engine.lock().unwrap();
             engine.preedit().to_string()
         };
         self.send_preedit(emitter, &preedit).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Self::hide_lookup_table(emitter).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
     }
@@ -368,9 +754,125 @@ impl JaimEngine {
     ) -> zbus::fdo::Result<()> {
         let cursor = text.chars().count() as u32;
         let visible = !text.is_empty();
-        Self::update_preedit_text(emitter, ibus_text(text), cursor, visible).await
+        // Preedit text must have an underline attribute for terminals to render it
+        let preedit_text = if visible {
+            let attrs = vec![ibus_attribute(1, 1, 0, cursor)]; // single underline
+            ibus_text_with_attrs(text, attrs)
+        } else {
+            ibus_text(text)
+        };
+        Self::update_preedit_text(emitter, preedit_text, cursor, visible, 0).await
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
         Ok(())
+    }
+
+    /// Register menu items (Export/Import) in the IBus property panel.
+    async fn register_menu(
+        &self,
+        emitter: &SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<()> {
+        // prop_type: 0=normal, 1=toggle, 2=radio, 3=separator, 4=menu
+        let export_prop = ibus_property(
+            "jaim-export", 0,
+            "Export Dictionary...", "",
+            "Export dictionary to a JSON file",
+        );
+        let import_prop = ibus_property(
+            "jaim-import", 0,
+            "Import Dictionary...", "",
+            "Import dictionary from a JSON file",
+        );
+
+        let prop_list = ibus_prop_list(vec![export_prop, import_prop]);
+
+        Self::register_properties(emitter, prop_list).await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Run dictionary export via zenity file dialog.
+    fn run_dict_export() {
+        let output = std::process::Command::new("zenity")
+            .args(["--file-selection", "--save", "--confirm-overwrite",
+                   "--title=JaIM: Export Dictionary",
+                   "--file-filter=JSON files (*.json) | *.json",
+                   "--filename=jaim_dict.json"])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if path.is_empty() {
+                    return;
+                }
+                let mut dict = Dictionary::new();
+                let user_dict_path = Dictionary::default_user_dict_path().unwrap();
+                let _ = dict.load_user_entries(&user_dict_path);
+                match dict.export(std::path::Path::new(&path)) {
+                    Ok(()) => {
+                        info!("JaIM: Dictionary exported to {}", path);
+                        let _ = std::process::Command::new("zenity")
+                            .args(["--info", "--title=JaIM",
+                                   &format!("--text=Dictionary exported to {}", path)])
+                            .spawn();
+                    }
+                    Err(e) => {
+                        warn!("JaIM: Export failed: {}", e);
+                        let _ = std::process::Command::new("zenity")
+                            .args(["--error", "--title=JaIM",
+                                   &format!("--text=Export failed: {}", e)])
+                            .spawn();
+                    }
+                }
+            }
+            _ => { /* user cancelled or zenity not available */ }
+        }
+    }
+
+    /// Run dictionary import via zenity file dialog.
+    fn run_dict_import() {
+        let output = std::process::Command::new("zenity")
+            .args(["--file-selection",
+                   "--title=JaIM: Import Dictionary",
+                   "--file-filter=JSON files (*.json) | *.json"])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if path.is_empty() {
+                    return;
+                }
+                let mut dict = Dictionary::new();
+                let user_dict_path = Dictionary::default_user_dict_path().unwrap();
+                let _ = dict.load_user_entries(&user_dict_path);
+                match dict.import(std::path::Path::new(&path)) {
+                    Ok(added) => {
+                        if let Err(e) = dict.save_user_entries(&user_dict_path) {
+                            warn!("JaIM: Failed to save after import: {}", e);
+                            let _ = std::process::Command::new("zenity")
+                                .args(["--error", "--title=JaIM",
+                                       &format!("--text=Failed to save: {}", e)])
+                                .spawn();
+                            return;
+                        }
+                        info!("JaIM: Imported {} entries from {}", added, path);
+                        let _ = std::process::Command::new("zenity")
+                            .args(["--info", "--title=JaIM",
+                                   &format!("--text=Imported {} new entries from {}", added, path)])
+                            .spawn();
+                    }
+                    Err(e) => {
+                        warn!("JaIM: Import failed: {}", e);
+                        let _ = std::process::Command::new("zenity")
+                            .args(["--error", "--title=JaIM",
+                                   &format!("--text=Import failed: {}", e)])
+                            .spawn();
+                    }
+                }
+            }
+            _ => { /* user cancelled or zenity not available */ }
+        }
     }
 
     async fn handle_backspace(
@@ -379,15 +881,8 @@ impl JaimEngine {
     ) -> zbus::fdo::Result<bool> {
         let new_preedit = {
             let mut engine = self.engine.lock().unwrap();
-            let preedit = engine.preedit().to_string();
-            if preedit.is_empty() {
+            if !engine.delete_last() {
                 return Ok(false);
-            }
-            // Reset and re-type all but the last character
-            let chars: Vec<char> = preedit.chars().collect();
-            engine.reset();
-            for &ch in &chars[..chars.len() - 1] {
-                engine.process_key(ch);
             }
             engine.preedit().to_string()
         };

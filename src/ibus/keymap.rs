@@ -14,11 +14,21 @@ pub const IBUS_KEY_ESCAPE: u32 = 0xFF1B;
 pub const IBUS_KEY_BACKSPACE: u32 = 0xFF08;
 pub const IBUS_KEY_TAB: u32 = 0xFF09;
 pub const IBUS_KEY_UP: u32 = 0xFF52;
-pub const IBUS_KEY_DOWN: u32 = 0xFF53;
+pub const IBUS_KEY_DOWN: u32 = 0xFF54;
 pub const IBUS_KEY_LEFT: u32 = 0xFF51;
-pub const IBUS_KEY_RIGHT: u32 = 0xFF54;
+pub const IBUS_KEY_RIGHT: u32 = 0xFF53;
 pub const IBUS_KEY_PAGE_UP: u32 = 0xFF55;
 pub const IBUS_KEY_PAGE_DOWN: u32 = 0xFF56;
+
+// Function keys
+pub const IBUS_KEY_F6: u32 = 0xFFC3;
+pub const IBUS_KEY_F7: u32 = 0xFFC4;
+pub const IBUS_KEY_F8: u32 = 0xFFC5;
+
+// Japanese keyboard toggle keys
+pub const IBUS_KEY_ZENKAKU_HANKAKU: u32 = 0xFF2A;
+pub const IBUS_KEY_HENKAN_MODE: u32 = 0xFF23;
+pub const IBUS_KEY_MUHENKAN: u32 = 0xFF22;
 
 /// Check if a keyval is a printable ASCII character (a-z, 0-9, punctuation).
 pub fn is_printable_ascii(keyval: u32) -> bool {

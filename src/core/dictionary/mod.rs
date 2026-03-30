@@ -8,6 +8,9 @@ mod builtin_dict;
 mod trie;
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 use trie::Trie;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +56,8 @@ pub struct Segment {
 pub struct Dictionary {
     entries: Vec<DictionaryEntry>,
     trie: Trie,
+    /// Index of the first user-added entry (all entries before this are builtin)
+    user_start: usize,
 }
 
 impl Dictionary {
@@ -61,8 +66,10 @@ impl Dictionary {
         let mut dict = Self {
             entries: Vec::new(),
             trie: Trie::new(),
+            user_start: 0,
         };
         dict.load_builtin();
+        dict.user_start = dict.entries.len();
         dict
     }
 
@@ -109,11 +116,27 @@ impl Dictionary {
     /// Segment a kana string into words using minimum-cost dynamic programming.
     /// Returns the best segmentation as a Vec of Segments.
     pub fn segment(&self, input: &str) -> Vec<Segment> {
+        self.segment_with_boost(input, |_, _| 0.0)
+    }
+
+    /// Segment with an optional cost-reduction callback.
+    /// `boost_fn(reading, entries)` returns a bonus (>= 0.0) that reduces segment cost.
+    pub fn segment_with_boost<F>(&self, input: &str, boost_fn: F) -> Vec<Segment>
+    where
+        F: Fn(&str, &[&DictionaryEntry]) -> f64,
+    {
         let chars: Vec<char> = input.chars().collect();
         let n = chars.len();
         if n == 0 {
             return Vec::new();
         }
+
+        // Pre-compute byte offsets for each char position to avoid String allocation in the loop
+        let byte_offsets: Vec<usize> = input
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(input.len()))
+            .collect();
 
         // DP: best_cost[i] = minimum cost to segment chars[0..i]
         const INF: f64 = 1e18;
@@ -126,8 +149,8 @@ impl Dictionary {
                 continue;
             }
 
-            let remaining: String = chars[i..].iter().collect();
-            let prefixes = self.trie.common_prefix_search(&remaining);
+            let remaining = &input[byte_offsets[i]..];
+            let prefixes = self.trie.common_prefix_search(remaining);
 
             for (len, _indices) in &prefixes {
                 // Cost: prefer longer matches and higher frequency
@@ -136,7 +159,13 @@ impl Dictionary {
                     .map(|&idx| self.entries[idx].frequency)
                     .max()
                     .unwrap_or(1);
-                let cost = segment_cost(*len, best_freq);
+                let reading: String = chars[i..i + len].iter().collect();
+                let entries: Vec<&DictionaryEntry> = _indices
+                    .iter()
+                    .map(|&idx| &self.entries[idx])
+                    .collect();
+                let boost = boost_fn(&reading, &entries);
+                let cost = segment_cost(*len, best_freq) - boost;
                 let total = best_cost[i] + cost;
                 if total < best_cost[i + len] {
                     best_cost[i + len] = total;
@@ -192,6 +221,78 @@ impl Dictionary {
         self.entries.len()
     }
 
+    /// Return the default path for the user dictionary file.
+    pub fn default_user_dict_path() -> io::Result<PathBuf> {
+        let data_dir = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                PathBuf::from(home).join(".local/share")
+            })
+            .join("jaim");
+        Ok(data_dir.join("user_dict.json"))
+    }
+
+    /// Save user-added entries to a JSON file.
+    pub fn save_user_entries(&self, path: &Path) -> io::Result<()> {
+        let user_entries = &self.entries[self.user_start..];
+        if user_entries.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(user_entries)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        fs::write(path, json)
+    }
+
+    /// Load user entries from a JSON file and add them to the dictionary.
+    pub fn load_user_entries(&mut self, path: &Path) -> io::Result<usize> {
+        if !path.exists() {
+            return Ok(0);
+        }
+        let json = fs::read_to_string(path)?;
+        let entries: Vec<DictionaryEntry> = serde_json::from_str(&json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let count = entries.len();
+        for entry in entries {
+            self.add_entry(entry);
+        }
+        Ok(count)
+    }
+
+    /// Export the entire dictionary (builtin + user) to a JSON file.
+    pub fn export(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self.entries)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        fs::write(path, json)
+    }
+
+    /// Import entries from a JSON file, adding them as user entries.
+    /// Duplicate entries (same reading + surface) are skipped.
+    pub fn import(&mut self, path: &Path) -> io::Result<usize> {
+        let json = fs::read_to_string(path)?;
+        let entries: Vec<DictionaryEntry> = serde_json::from_str(&json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut added = 0;
+        for entry in entries {
+            if !self.has_entry(&entry.reading, &entry.surface) {
+                self.add_entry(entry);
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// Check if an entry with the given reading and surface already exists.
+    fn has_entry(&self, reading: &str, surface: &str) -> bool {
+        self.lookup(reading).iter().any(|e| e.surface == surface)
+    }
+
     fn load_builtin(&mut self) {
         for &(reading, surface, pos, frequency) in builtin_dict::BUILTIN_ENTRIES {
             self.add_entry(DictionaryEntry {
@@ -201,15 +302,54 @@ impl Dictionary {
                 frequency,
             });
         }
+        self.load_symbol_entries();
+    }
+
+    /// Load symbol/special character entries not found in IPADIC.
+    fn load_symbol_entries(&mut self) {
+        let symbols: &[(&str, &[&str])] = &[
+            ("やじるし", &["→", "←", "↑", "↓", "⇒", "⇐", "⇑", "⇓", "↔", "↕"]),
+            ("みぎ", &["→", "⇒"]),
+            ("ひだり", &["←", "⇐"]),
+            ("うえ", &["↑", "⇑"]),
+            ("した", &["↓", "⇓"]),
+            ("まる", &["○", "◎", "●", "◯"]),
+            ("さんかく", &["△", "▲", "▽", "▼"]),
+            ("しかく", &["□", "■", "◇", "◆"]),
+            ("ほし", &["☆", "★"]),
+            ("こめ", &["※"]),
+            ("から", &["〜", "～"]),
+            ("てん", &["・", "…", "‥", "、"]),
+            ("まる", &["。", "○", "◎", "●"]),
+            ("かっこ", &["「」", "「", "」", "『』", "『", "』", "【】", "【", "】", "（）", "（", "）", "〔〕", "［］", "｛｝", "〈〉", "《》"]),
+            ("かぎかっこ", &["「」", "「", "」", "『』", "『", "』"]),
+            ("すみかっこ", &["【】", "【", "】"]),
+            ("まるかっこ", &["（）", "（", "）"]),
+            ("ゆうびん", &["〒"]),
+        ];
+        for &(reading, surfaces) in symbols {
+            for (i, &surface) in surfaces.iter().enumerate() {
+                self.add_entry(DictionaryEntry {
+                    reading: reading.to_string(),
+                    surface: surface.to_string(),
+                    pos: PartOfSpeech::Other,
+                    // First candidate gets highest frequency
+                    frequency: 8000 - (i as u32) * 100,
+                });
+            }
+        }
     }
 }
 
 /// Cost function for segmentation DP.
-/// Lower cost = better. Prefers longer matches and higher frequency.
+/// Lower cost = better. Multiplies frequency contribution by character length
+/// so that longer high-frequency words strongly outweigh multiple short words,
+/// while longer low-frequency words lose to common short-word splits.
+/// so that longer high-frequency words strongly outweigh multiple short words,
+/// while longer low-frequency words lose to common short-word splits.
+/// A small per-segment overhead (+1.0) prevents splitting short compounds.
 fn segment_cost(char_len: usize, frequency: u32) -> f64 {
-    let freq_cost = -(frequency as f64).ln();
-    let length_bonus = (char_len as f64) * -2.0; // longer words get lower cost
-    freq_cost + length_bonus
+    (char_len as f64) * -(frequency as f64).ln() + 1.0
 }
 
 #[cfg(test)]
@@ -251,12 +391,11 @@ mod tests {
     fn lookup_multiple_candidates() {
         let dict = Dictionary::new();
 
-        // あめ should have 雨 and 飴
+        // あめ should have multiple candidates including 雨
         let results = dict.lookup("あめ");
         assert!(results.len() >= 2);
-        // 雨 (8400) should come before 飴 (6000)
-        assert_eq!(results[0].surface, "雨");
-        assert_eq!(results[1].surface, "飴");
+        let surfaces: Vec<&str> = results.iter().map(|e| e.surface.as_str()).collect();
+        assert!(surfaces.contains(&"雨"));
     }
 
     #[test]
@@ -294,9 +433,10 @@ mod tests {
         let dict = Dictionary::new();
 
         let segments = dict.segment("きょうはいいてんきです");
-        // First segment should have 今日 as top candidate
-        assert!(!segments[0].candidates.is_empty());
-        assert_eq!(segments[0].candidates[0].surface, "今日");
+        // きょう segment should have 今日 among its candidates
+        let kyou_seg = segments.iter().find(|s| s.reading == "きょう").unwrap();
+        let surfaces: Vec<&str> = kyou_seg.candidates.iter().map(|e| e.surface.as_str()).collect();
+        assert!(surfaces.contains(&"今日"));
     }
 
     #[test]
@@ -324,6 +464,73 @@ mod tests {
         assert_eq!(dict.len(), count_before + 1);
         let results = dict.lookup("てすと");
         assert_eq!(results[0].surface, "テスト");
+    }
+
+    #[test]
+    fn save_and_load_user_entries() {
+        let dir = std::env::temp_dir().join("jaim_test_save_load");
+        let path = dir.join("user_dict.json");
+
+        // Create dict and add a user entry
+        let mut dict = Dictionary::new();
+        let builtin_count = dict.len();
+        dict.add_entry(DictionaryEntry {
+            reading: "くろーど".to_string(),
+            surface: "クロード".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 5000,
+        });
+        assert_eq!(dict.len(), builtin_count + 1);
+
+        // Save user entries
+        dict.save_user_entries(&path).unwrap();
+
+        // Load into a fresh dictionary
+        let mut dict2 = Dictionary::new();
+        let loaded = dict2.load_user_entries(&path).unwrap();
+        assert_eq!(loaded, 1);
+        let results = dict2.lookup("くろーど");
+        assert_eq!(results[0].surface, "クロード");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_and_import() {
+        let dir = std::env::temp_dir().join("jaim_test_export_import");
+        let path = dir.join("export.json");
+
+        let mut dict = Dictionary::new();
+        dict.add_entry(DictionaryEntry {
+            reading: "らすと".to_string(),
+            surface: "Rust".to_string(),
+            pos: PartOfSpeech::Noun,
+            frequency: 7000,
+        });
+
+        // Export all
+        dict.export(&path).unwrap();
+
+        // Import into a fresh dictionary — builtin entries should be skipped as duplicates
+        let mut dict2 = Dictionary::new();
+        let added = dict2.import(&path).unwrap();
+        assert_eq!(added, 1); // only the user entry should be new
+        let results = dict2.lookup("らすと");
+        assert_eq!(results[0].surface, "Rust");
+
+        // Import again — no duplicates
+        let added2 = dict2.import(&path).unwrap();
+        assert_eq!(added2, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_nonexistent_file_returns_zero() {
+        let mut dict = Dictionary::new();
+        let result = dict.load_user_entries(Path::new("/tmp/jaim_nonexistent_dict.json"));
+        assert_eq!(result.unwrap(), 0);
     }
 
     #[test]

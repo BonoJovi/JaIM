@@ -7,9 +7,8 @@
 ///
 /// Runs on a background thread with KV cache pre-warming
 /// to minimize latency at conversion time.
-///
-/// Current implementation uses a mock scorer based on character frequency
-/// heuristics. Will be replaced with llama-cpp-rs integration.
+
+mod llama_scorer;
 
 /// Trait defining the LLM scoring interface.
 /// Allows swapping between mock and real implementations.
@@ -22,6 +21,8 @@ pub trait LlmScorer: Send + Sync {
     fn warm_cache(&self, context: &str);
 }
 
+pub use llama_scorer::LlamaScorer;
+
 /// LLM engine that uses a pluggable scorer for candidate reranking.
 pub struct LlmEngine {
     scorer: Box<dyn LlmScorer>,
@@ -30,10 +31,21 @@ pub struct LlmEngine {
 }
 
 impl LlmEngine {
-    /// Create with the default mock scorer.
+    /// Create with the best available scorer.
+    /// Uses LlamaScorer if the GGUF model is found, otherwise falls back to MockScorer.
     pub fn new() -> Self {
+        let scorer: Box<dyn LlmScorer> = match LlamaScorer::from_default_path() {
+            Some(s) => {
+                log::info!("LlmEngine: using real LlamaScorer");
+                Box::new(s)
+            }
+            None => {
+                log::info!("LlmEngine: no model found, using MockScorer");
+                Box::new(MockScorer)
+            }
+        };
         Self {
-            scorer: Box::new(MockScorer),
+            scorer,
             context: String::new(),
         }
     }
@@ -74,6 +86,15 @@ impl LlmEngine {
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        if !scored.is_empty() {
+            log::debug!(
+                "LLM rerank: context='{}' top='{}' ({:.3}) from {} candidates",
+                self.context,
+                scored[0].0,
+                scored[0].1,
+                scored.len(),
+            );
+        }
         scored
     }
 
