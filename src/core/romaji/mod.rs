@@ -253,6 +253,157 @@ pub fn hiragana_to_halfwidth_katakana(s: &str) -> String {
     result
 }
 
+/// Convert a hiragana string back to half-width ASCII romaji.
+/// Uses the romaji table in reverse. Characters not found (kanji, symbols, etc.)
+/// are passed through after converting full-width forms to half-width.
+pub fn hiragana_to_romaji(s: &str) -> String {
+    let mut result = String::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        // Try 3-char, then 2-char, then 1-char match
+        let mut matched = false;
+        for len in (1..=3).rev() {
+            if i + len > chars.len() {
+                continue;
+            }
+            let slice: String = chars[i..i + len].iter().collect();
+            if let Some(romaji) = kana_to_romaji_lookup(&slice) {
+                result.push_str(romaji);
+                i += len;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            let c = chars[i];
+            // っ → double the next consonant, or "xtu" if at end
+            if c == 'っ' {
+                let mut doubled = false;
+                if i + 1 < chars.len() {
+                    for len in (1..=3).rev() {
+                        if i + 1 + len > chars.len() {
+                            continue;
+                        }
+                        let next_slice: String = chars[i + 1..i + 1 + len].iter().collect();
+                        if let Some(romaji) = kana_to_romaji_lookup(&next_slice) {
+                            if let Some(consonant) = romaji.chars().next() {
+                                if consonant.is_ascii_alphabetic() {
+                                    result.push(consonant);
+                                    doubled = true;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                if !doubled {
+                    result.push_str("xtu");
+                }
+                i += 1;
+                continue;
+            }
+            // Full-width → half-width conversion for non-kana
+            match c {
+                '。' => result.push('.'),
+                '、' => result.push(','),
+                '！' => result.push('!'),
+                '？' => result.push('?'),
+                '（' => result.push('('),
+                '）' => result.push(')'),
+                '［' => result.push('['),
+                '］' => result.push(']'),
+                '｛' => result.push('{'),
+                '｝' => result.push('}'),
+                '＋' => result.push('+'),
+                '＝' => result.push('='),
+                '＊' => result.push('*'),
+                '／' => result.push('/'),
+                '＼' => result.push('\\'),
+                '＆' => result.push('&'),
+                '＠' => result.push('@'),
+                '＃' => result.push('#'),
+                '＄' => result.push('$'),
+                '％' => result.push('%'),
+                '＾' => result.push('^'),
+                '｜' => result.push('|'),
+                '～' => result.push('~'),
+                '＜' => result.push('<'),
+                '＞' => result.push('>'),
+                '：' => result.push(':'),
+                '；' => result.push(';'),
+                '＿' => result.push('_'),
+                '＂' => result.push('"'),
+                '｀' => result.push('`'),
+                'ー' => result.push('-'),
+                _ => result.push(c),
+            }
+            i += 1;
+        }
+    }
+    result
+}
+
+/// Convert a hiragana string to full-width ASCII romaji.
+/// First converts to half-width romaji, then maps each ASCII char to its full-width equivalent.
+pub fn hiragana_to_fullwidth_romaji(s: &str) -> String {
+    let romaji = hiragana_to_romaji(s);
+    romaji
+        .chars()
+        .map(|c| match c {
+            'a'..='z' => char::from_u32(c as u32 - 'a' as u32 + 'ａ' as u32).unwrap_or(c),
+            'A'..='Z' => char::from_u32(c as u32 - 'A' as u32 + 'Ａ' as u32).unwrap_or(c),
+            '0'..='9' => char::from_u32(c as u32 - '0' as u32 + '０' as u32).unwrap_or(c),
+            '!' => '！', '?' => '？', '.' => '。', ',' => '、',
+            '(' => '（', ')' => '）', '[' => '［', ']' => '］',
+            '{' => '｛', '}' => '｝', '+' => '＋', '=' => '＝',
+            '*' => '＊', '/' => '／', '\\' => '＼', '&' => '＆',
+            '@' => '＠', '#' => '＃', '$' => '＄', '%' => '％',
+            '^' => '＾', '|' => '｜', '~' => '～', '<' => '＜',
+            '>' => '＞', ':' => '：', ';' => '；', '_' => '＿',
+            '"' => '＂', '\'' => '＇', '`' => '｀', '-' => 'ー',
+            ' ' => '\u{3000}', // full-width space
+            _ => c,
+        })
+        .collect()
+}
+
+/// Reverse lookup: kana string → romaji.
+/// Prefers shorter/common romaji forms, and only pure-alpha results
+/// (avoids "n'" for ん — handled specially in the caller).
+fn kana_to_romaji_lookup(kana: &str) -> Option<&'static str> {
+    if kana == "ん" {
+        return Some("n");
+    }
+    // っ is handled specially in hiragana_to_romaji (consonant doubling)
+    if kana == "っ" {
+        return None;
+    }
+    let mut best: Option<&'static str> = None;
+    for &(romaji, k) in ROMAJI_TABLE.iter() {
+        if k == kana {
+            // Prefer shortest, alpha-only romaji
+            let dominated = match best {
+                None => false,
+                Some(prev) => {
+                    if romaji.len() < prev.len() {
+                        false
+                    } else if romaji.len() == prev.len() {
+                        // Prefer alpha-only over forms with punctuation
+                        !romaji.chars().all(|c| c.is_ascii_alphabetic())
+                    } else {
+                        true
+                    }
+                }
+            };
+            if !dominated {
+                best = Some(romaji);
+            }
+        }
+    }
+    best
+}
+
 fn exact_lookup(s: &str) -> Option<&'static str> {
     ROMAJI_TABLE
         .binary_search_by_key(&s, |&(romaji, _)| romaji)
@@ -486,5 +637,42 @@ mod tests {
     fn halfwidth_symbols() {
         assert_eq!(hiragana_to_halfwidth_katakana("！？"), "!?");
         assert_eq!(hiragana_to_halfwidth_katakana("（）"), "()");
+    }
+
+    #[test]
+    fn romaji_basic() {
+        assert_eq!(hiragana_to_romaji("か"), "ka");
+        assert_eq!(hiragana_to_romaji("し"), "si");
+        assert_eq!(hiragana_to_romaji("ち"), "ti");
+        assert_eq!(hiragana_to_romaji("つ"), "tu");
+    }
+
+    #[test]
+    fn romaji_words() {
+        assert_eq!(hiragana_to_romaji("とうきょう"), "toukyou");
+        assert_eq!(hiragana_to_romaji("にほんご"), "nihongo");
+    }
+
+    #[test]
+    fn romaji_sokuon() {
+        // っ + consonant → doubled consonant
+        assert_eq!(hiragana_to_romaji("がっこう"), "gakkou");
+        assert_eq!(hiragana_to_romaji("きって"), "kitte");
+    }
+
+    #[test]
+    fn romaji_fullwidth_symbols() {
+        assert_eq!(hiragana_to_romaji("。"), ".");
+        assert_eq!(hiragana_to_romaji("、"), ",");
+        assert_eq!(hiragana_to_romaji("！"), "!");
+    }
+
+    #[test]
+    fn romaji_compound() {
+        // Compound sounds should match as multi-char kana
+        let sha = hiragana_to_romaji("しゃ");
+        assert!(sha == "sya" || sha == "sha", "got: {}", sha);
+        let cho = hiragana_to_romaji("ちょ");
+        assert!(cho == "tyo" || cho == "cho", "got: {}", cho);
     }
 }

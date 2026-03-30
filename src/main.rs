@@ -1,10 +1,8 @@
-mod core;
-mod engine;
 mod ibus;
 
 use log::info;
 
-use crate::core::dictionary::Dictionary;
+use jaim::core::dictionary::Dictionary;
 use std::path::PathBuf;
 
 fn init_logging() {

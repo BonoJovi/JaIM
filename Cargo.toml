@@ -1,11 +1,15 @@
 [package]
 name = "jaim"
-version = "0.9.1"
+version = "1.0.0"
 edition = "2024"
 authors = ["Yoshihiro NAKAHARA"]
 description = "Japanese AI-powered Input Method - LLM-based intelligent Japanese input for Linux"
 license = "MIT"
 repository = "https://github.com/BonoJovi/JaIM"
+
+[lib]
+name = "jaim"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # D-Bus for IBus integration

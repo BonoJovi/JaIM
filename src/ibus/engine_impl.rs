@@ -9,8 +9,8 @@ use log::{debug, info, warn};
 use zbus::object_server::SignalEmitter;
 use zbus::{interface, zvariant};
 
-use crate::core::dictionary::Dictionary;
-use crate::engine::{ConversionEngine, ConversionState};
+use jaim::core::dictionary::Dictionary;
+use jaim::engine::{ConversionEngine, ConversionState};
 
 use super::config::{CompiledToggleKey, JaimConfig};
 use super::keymap::*;
@@ -190,8 +190,19 @@ impl JaimEngine {
         _keycode: u32,
         state: u32,
     ) -> zbus::fdo::Result<bool> {
-        // Ignore key releases
+        // Consume releases for function keys (F6–F10) when IME is active,
+        // to prevent GTK apps from opening menus on F10 release.
         if is_release(state) {
+            let enabled = *self.enabled.lock().unwrap();
+            if enabled
+                && (keyval == IBUS_KEY_F6
+                    || keyval == IBUS_KEY_F7
+                    || keyval == IBUS_KEY_F8
+                    || keyval == IBUS_KEY_F9
+                    || keyval == IBUS_KEY_F10)
+            {
+                return Ok(true);
+            }
             return Ok(false);
         }
 
@@ -243,21 +254,55 @@ impl JaimEngine {
             }
         }
 
-        // F7 → full-width katakana, F8 → half-width katakana
-        if keyval == IBUS_KEY_F7 || keyval == IBUS_KEY_F8 {
-            let form = if keyval == IBUS_KEY_F8 { 2 } else { 1 };
+        // F7 → full-width katakana, F8 → half-width katakana, F9 → full-width romaji, F10 → half-width romaji
+        if keyval == IBUS_KEY_F7 || keyval == IBUS_KEY_F8 || keyval == IBUS_KEY_F9 || keyval == IBUS_KEY_F10 {
+            info!("JaIM: F-key 0x{:04X} converting={}", keyval, converting);
+            let form = match keyval {
+                IBUS_KEY_F8 => 2,
+                IBUS_KEY_F9 => 4,
+                IBUS_KEY_F10 => 3,
+                _ => 1,
+            };
             if converting {
-                let half = keyval == IBUS_KEY_F8;
-                return self.convert_focused_to_kana(&emitter, half).await;
+                match keyval {
+                    IBUS_KEY_F9 => return self.convert_focused_to_fullwidth_romaji(&emitter).await,
+                    IBUS_KEY_F10 => return self.convert_focused_to_romaji(&emitter).await,
+                    _ => {
+                        let half = keyval == IBUS_KEY_F8;
+                        return self.convert_focused_to_kana(&emitter, half).await;
+                    }
+                }
             } else {
-                // Enter kana conversion mode with katakana/half-width selected
                 return self.start_kana_conversion(&emitter, form).await;
             }
         }
 
-        // Handle special keys during conversion mode
+        // Handle keys during conversion mode
         if converting {
-            return self.handle_conversion_key(&emitter, keyval, state).await;
+            let result = self.handle_conversion_key(&emitter, keyval, state).await?;
+            if result {
+                return Ok(true);
+            }
+            // Non-printable keys (modifiers, function keys, etc.) — consume without committing
+            if keyval_to_char(keyval).is_none() {
+                return Ok(true);
+            }
+            // Printable key not handled by conversion — commit conversion first,
+            // then fall through to process the key as new input
+            let text = {
+                let mut engine = self.engine.lock().unwrap();
+                engine.commit_conversion()
+            };
+            if let Some(text) = text {
+                Self::commit_text(&emitter, ibus_text(&text)).await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                Self::hide_preedit_text(&emitter).await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                Self::hide_lookup_table(&emitter).await
+                    .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+                *self.converting.lock().unwrap() = false;
+            }
+            // Fall through to process the key as new input
         }
 
         // Space → trigger conversion
@@ -346,6 +391,12 @@ impl JaimEngine {
                 self.send_preedit(&emitter, &preedit).await?;
                 return Ok(true);
             }
+        }
+
+        // Consume unhandled keys while preedit is active to prevent stray characters
+        let has_preedit = !self.engine.lock().unwrap().preedit().is_empty();
+        if has_preedit {
+            return Ok(true);
         }
 
         // Unhandled key
@@ -645,6 +696,36 @@ impl JaimEngine {
             } else {
                 engine.convert_focused_to_katakana().cloned()
             }
+        };
+        if let Some(conv) = conv {
+            self.show_conversion_state(emitter, &conv).await?;
+        }
+        Ok(true)
+    }
+
+    /// Convert the focused segment to romaji (F9 during conversion mode).
+    async fn convert_focused_to_romaji(
+        &self,
+        emitter: &SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<bool> {
+        let conv = {
+            let mut engine = self.engine.lock().unwrap();
+            engine.convert_focused_to_romaji().cloned()
+        };
+        if let Some(conv) = conv {
+            self.show_conversion_state(emitter, &conv).await?;
+        }
+        Ok(true)
+    }
+
+    /// Convert the focused segment to full-width romaji (F10 during conversion mode).
+    async fn convert_focused_to_fullwidth_romaji(
+        &self,
+        emitter: &SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<bool> {
+        let conv = {
+            let mut engine = self.engine.lock().unwrap();
+            engine.convert_focused_to_fullwidth_romaji().cloned()
         };
         if let Some(conv) = conv {
             self.show_conversion_state(emitter, &conv).await?;

@@ -8,6 +8,8 @@
 /// Flow: keystroke → romaji → kana → dictionary segment → grammar score
 ///       → LLM rerank → candidate list → user selects → commit
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 use crate::core::{
     dictionary::{Dictionary, DictionaryEntry, Segment},
     grammar::{GrammarEngine, GrammarToken},
@@ -65,39 +67,60 @@ impl ConversionState {
     }
 }
 
+/// Shared heavy resources (dictionary, grammar, LLM, user scorer).
+/// Initialized once per process and shared across all InputContexts.
+pub struct SharedCore {
+    pub dictionary: Dictionary,
+    pub grammar: GrammarEngine,
+    pub llm: Mutex<LlmEngine>,
+    pub user_scorer: Mutex<UserScorer>,
+    pub user_scores_path: Option<std::path::PathBuf>,
+}
+
+/// Global shared core, initialized on first use.
+static SHARED_CORE: OnceLock<Arc<SharedCore>> = OnceLock::new();
+
+impl SharedCore {
+    /// Get or initialize the global shared core.
+    pub fn global() -> Arc<SharedCore> {
+        SHARED_CORE
+            .get_or_init(|| {
+                let scores_path = UserScorer::default_path().ok();
+                let user_scorer = scores_path
+                    .as_ref()
+                    .and_then(|p| match UserScorer::load(p) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            log::warn!("Failed to load user scores: {}", e);
+                            None
+                        }
+                    })
+                    .unwrap_or_else(UserScorer::new);
+
+                Arc::new(SharedCore {
+                    dictionary: Dictionary::new(),
+                    grammar: GrammarEngine::new(),
+                    llm: Mutex::new(LlmEngine::new()),
+                    user_scorer: Mutex::new(user_scorer),
+                    user_scores_path: scores_path,
+                })
+            })
+            .clone()
+    }
+}
+
 pub struct ConversionEngine {
     romaji: RomajiConverter,
-    dictionary: Dictionary,
-    grammar: GrammarEngine,
-    llm: LlmEngine,
-    user_scorer: UserScorer,
-    /// Path to persist user scores
-    user_scores_path: Option<std::path::PathBuf>,
+    shared: Arc<SharedCore>,
     /// Active conversion state (None when not converting)
     conversion: Option<ConversionState>,
 }
 
 impl ConversionEngine {
     pub fn new() -> Self {
-        let scores_path = UserScorer::default_path().ok();
-        let user_scorer = scores_path
-            .as_ref()
-            .and_then(|p| match UserScorer::load(p) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    log::warn!("Failed to load user scores: {}", e);
-                    None
-                }
-            })
-            .unwrap_or_else(UserScorer::new);
-
         Self {
             romaji: RomajiConverter::new(),
-            dictionary: Dictionary::new(),
-            grammar: GrammarEngine::new(),
-            llm: LlmEngine::new(),
-            user_scorer,
-            user_scores_path: scores_path,
+            shared: SharedCore::global(),
             conversion: None,
         }
     }
@@ -137,13 +160,15 @@ impl ConversionEngine {
             return None;
         }
 
-        let segments = self.dictionary.segment_with_boost(&kana, |reading, entries| {
+        let user_scorer = self.shared.user_scorer.lock().unwrap();
+        let segments = self.shared.dictionary.segment_with_boost(&kana, |reading, entries| {
             entries
                 .iter()
-                .map(|e| self.user_scorer.score(reading, &e.surface))
+                .map(|e| user_scorer.score(reading, &e.surface))
                 .fold(0.0_f64, f64::max)
                 * 10.0 // Scale boost to be significant vs segment cost
         });
+        drop(user_scorer);
         if segments.is_empty() {
             return None;
         }
@@ -283,10 +308,10 @@ impl ConversionEngine {
         self.conversion.as_ref()
     }
 
-    /// Start a kana-form conversion (F6/F7/F8 outside conversion mode).
-    /// Creates a single-segment conversion with hiragana, katakana, and half-width katakana
-    /// as candidates, and selects the one matching the requested form.
-    /// form: 0 = hiragana, 1 = katakana, 2 = half-width katakana
+    /// Start a kana-form conversion (F6/F7/F8/F9/F10 outside conversion mode).
+    /// Creates a single-segment conversion with hiragana, katakana, half-width katakana,
+    /// half-width romaji, and full-width romaji as candidates, and selects the one matching the requested form.
+    /// form: 0 = hiragana, 1 = katakana, 2 = half-width katakana, 3 = half-width romaji, 4 = full-width romaji
     pub fn start_kana_conversion(&mut self, form: usize) -> Option<&ConversionState> {
         self.romaji.flush();
         let kana = self.romaji.output().to_string();
@@ -296,8 +321,10 @@ impl ConversionEngine {
 
         let katakana = crate::core::romaji::hiragana_to_katakana(&kana);
         let half_katakana = crate::core::romaji::hiragana_to_halfwidth_katakana(&kana);
+        let romaji = crate::core::romaji::hiragana_to_romaji(&kana);
+        let fw_romaji = crate::core::romaji::hiragana_to_fullwidth_romaji(&kana);
 
-        let mut candidates = vec![kana.clone(), katakana, half_katakana];
+        let mut candidates = vec![kana.clone(), katakana, half_katakana, romaji, fw_romaji];
         // Deduplicate while preserving order
         let mut seen = std::collections::HashSet::new();
         candidates.retain(|c| seen.insert(c.clone()));
@@ -311,7 +338,7 @@ impl ConversionEngine {
                 start: 0,
                 candidates,
                 selected,
-                user_selected: form != 0, // F7/F8 is an explicit choice
+                user_selected: form != 0,
             }],
             focus: 0,
         });
@@ -347,19 +374,20 @@ impl ConversionEngine {
             return Vec::new();
         }
 
-        let segments = self.dictionary.segment(&kana);
+        let segments = self.shared.dictionary.segment(&kana);
         if segments.is_empty() {
             return Vec::new();
         }
 
         let candidates = self.build_candidates(&segments);
 
+        let llm = self.shared.llm.lock().unwrap();
         let mut scored: Vec<ConversionCandidate> = candidates
             .into_iter()
             .map(|text| {
                 let grammar_tokens = self.tokens_for_grammar(&text, &segments);
-                let grammar_result = self.grammar.score(&grammar_tokens);
-                let llm_score = self.llm.score_candidate(&text);
+                let grammar_result = self.shared.grammar.score(&grammar_tokens);
+                let llm_score = llm.score_candidate(&text);
                 let combined = grammar_result.score * 0.4 + llm_score * 0.6;
                 ConversionCandidate {
                     text,
@@ -370,8 +398,39 @@ impl ConversionEngine {
             })
             .collect();
 
+        drop(llm);
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         scored
+    }
+
+    /// Convert the focused segment's reading to half-width romaji (F9 during conversion mode).
+    pub fn convert_focused_to_romaji(&mut self) -> Option<&ConversionState> {
+        let state = self.conversion.as_mut()?;
+        let seg = &mut state.segments[state.focus];
+        let romaji = crate::core::romaji::hiragana_to_romaji(&seg.reading);
+        if let Some(pos) = seg.candidates.iter().position(|c| c == &romaji) {
+            seg.selected = pos;
+        } else {
+            seg.candidates.push(romaji);
+            seg.selected = seg.candidates.len() - 1;
+        }
+        seg.user_selected = true;
+        self.conversion.as_ref()
+    }
+
+    /// Convert the focused segment's reading to full-width romaji (F10 during conversion mode).
+    pub fn convert_focused_to_fullwidth_romaji(&mut self) -> Option<&ConversionState> {
+        let state = self.conversion.as_mut()?;
+        let seg = &mut state.segments[state.focus];
+        let fw_romaji = crate::core::romaji::hiragana_to_fullwidth_romaji(&seg.reading);
+        if let Some(pos) = seg.candidates.iter().position(|c| c == &fw_romaji) {
+            seg.selected = pos;
+        } else {
+            seg.candidates.push(fw_romaji);
+            seg.selected = seg.candidates.len() - 1;
+        }
+        seg.user_selected = true;
+        self.conversion.as_ref()
     }
 
     /// Convert the focused segment's reading to half-width katakana.
@@ -411,7 +470,7 @@ impl ConversionEngine {
 
     /// Commit the selected candidate and update context.
     pub fn commit(&mut self, candidate: &str) -> String {
-        self.llm.update_context(candidate);
+        self.shared.llm.lock().unwrap().update_context(candidate);
         self.romaji.reset();
         candidate.to_string()
     }
@@ -423,21 +482,24 @@ impl ConversionEngine {
         let text = state.composed_text();
 
         // Record only segments where the user explicitly chose a candidate
-        for seg in &state.segments {
-            if seg.user_selected {
-                let surface = &seg.candidates[seg.selected];
-                self.user_scorer.record(&seg.reading, surface);
+        {
+            let mut user_scorer = self.shared.user_scorer.lock().unwrap();
+            for seg in &state.segments {
+                if seg.user_selected {
+                    let surface = &seg.candidates[seg.selected];
+                    user_scorer.record(&seg.reading, surface);
+                }
+            }
+
+            // Persist scores
+            if let Some(ref path) = self.shared.user_scores_path {
+                if let Err(e) = user_scorer.save(path) {
+                    log::warn!("Failed to save user scores: {}", e);
+                }
             }
         }
 
-        // Persist scores
-        if let Some(ref path) = self.user_scores_path {
-            if let Err(e) = self.user_scorer.save(path) {
-                log::warn!("Failed to save user scores: {}", e);
-            }
-        }
-
-        self.llm.update_context(&text);
+        self.shared.llm.lock().unwrap().update_context(&text);
         self.romaji.reset();
         Some(text)
     }
@@ -456,13 +518,14 @@ impl ConversionEngine {
     /// Build SegmentState list from dictionary Segments.
     /// Candidates are ordered by effective score (dictionary frequency + user learning).
     fn build_segment_states(&self, segments: &[Segment]) -> Vec<SegmentState> {
+        let user_scorer = self.shared.user_scorer.lock().unwrap();
         segments
             .iter()
             .map(|seg| {
                 let mut entries: Vec<&DictionaryEntry> = seg.candidates.iter().collect();
                 entries.sort_by(|a, b| {
-                    let score_a = self.effective_score(&seg.reading, a);
-                    let score_b = self.effective_score(&seg.reading, b);
+                    let score_a = Self::effective_score_with(&user_scorer, &seg.reading, a);
+                    let score_b = Self::effective_score_with(&user_scorer, &seg.reading, b);
                     score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 let mut candidates: Vec<String> =
@@ -484,9 +547,9 @@ impl ConversionEngine {
 
     /// Compute effective score combining dictionary frequency and user learning.
     /// User learning is additive: even one selection gives a significant boost.
-    fn effective_score(&self, reading: &str, entry: &DictionaryEntry) -> f64 {
+    fn effective_score_with(user_scorer: &UserScorer, reading: &str, entry: &DictionaryEntry) -> f64 {
         let freq_norm = (entry.frequency as f64) / 10000.0;
-        let user = self.user_scorer.score(reading, &entry.surface);
+        let user = user_scorer.score(reading, &entry.surface);
         freq_norm + user * 2.0
     }
 
@@ -496,12 +559,14 @@ impl ConversionEngine {
             Some(state) => state.segments[idx].reading.clone(),
             None => return,
         };
-        let mut entries = self.dictionary.lookup(&reading);
+        let mut entries = self.shared.dictionary.lookup(&reading);
+        let user_scorer = self.shared.user_scorer.lock().unwrap();
         entries.sort_by(|a, b| {
-            let score_a = self.effective_score(&reading, a);
-            let score_b = self.effective_score(&reading, b);
+            let score_a = Self::effective_score_with(&user_scorer, &reading, a);
+            let score_b = Self::effective_score_with(&user_scorer, &reading, b);
             score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
         });
+        drop(user_scorer);
         let mut candidates: Vec<String> = entries.iter().map(|e| e.surface.clone()).collect();
         if candidates.is_empty() || !candidates.contains(&reading) {
             candidates.push(reading);
@@ -784,5 +849,37 @@ mod tests {
         let ranges = state.segment_char_ranges();
         assert_eq!(ranges[0].0, 0);
         assert!(ranges.last().unwrap().1 > 0);
+    }
+
+    #[test]
+    fn f9_kana_conversion_fullwidth_romaji() {
+        let mut engine = ConversionEngine::new();
+        for ch in "tesuto".chars() {
+            engine.process_key(ch);
+        }
+        assert_eq!(engine.preedit(), "てすと");
+
+        // F9 → start_kana_conversion(4) = full-width romaji
+        let state = engine.start_kana_conversion(4);
+        assert!(state.is_some(), "start_kana_conversion(4) returned None");
+        let state = state.unwrap();
+        let composed = state.composed_text();
+        assert_eq!(composed, "ｔｅｓｕｔｏ", "F9 should produce full-width romaji, got: {}", composed);
+    }
+
+    #[test]
+    fn f10_kana_conversion_halfwidth_romaji() {
+        let mut engine = ConversionEngine::new();
+        for ch in "tesuto".chars() {
+            engine.process_key(ch);
+        }
+        assert_eq!(engine.preedit(), "てすと");
+
+        // F10 → start_kana_conversion(3) = half-width romaji
+        let state = engine.start_kana_conversion(3);
+        assert!(state.is_some(), "start_kana_conversion(3) returned None");
+        let state = state.unwrap();
+        let composed = state.composed_text();
+        assert_eq!(composed, "tesuto", "F10 should produce half-width romaji, got: {}", composed);
     }
 }
