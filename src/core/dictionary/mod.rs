@@ -338,6 +338,40 @@ impl Dictionary {
                 });
             }
         }
+
+        // Common auxiliary verb compound forms not in IPADIC
+        let auxiliaries: &[(&str, &str)] = &[
+            ("ましょう", "ましょう"),
+            ("ません", "ません"),
+            ("ました", "ました"),
+            ("ませんでした", "ませんでした"),
+            ("でしょう", "でしょう"),
+            ("でした", "でした"),
+            ("ですが", "ですが"),
+            ("ですけど", "ですけど"),
+            ("ですから", "ですから"),
+            ("ですので", "ですので"),
+            ("ですよね", "ですよね"),
+            ("ですよ", "ですよ"),
+            ("ですね", "ですね"),
+            ("ですか", "ですか"),
+            ("ますが", "ますが"),
+            ("ますか", "ますか"),
+            ("ますよ", "ますよ"),
+            ("ますね", "ますね"),
+            ("ください", "ください"),
+            ("くださる", "くださる"),
+            ("ております", "ております"),
+            ("いたします", "いたします"),
+        ];
+        for &(reading, surface) in auxiliaries {
+            self.add_entry(DictionaryEntry {
+                reading: reading.to_string(),
+                surface: surface.to_string(),
+                pos: PartOfSpeech::Auxiliary,
+                frequency: 9000,
+            });
+        }
     }
 }
 
