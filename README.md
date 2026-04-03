@@ -4,7 +4,7 @@
 
 **Japanese Input Method / Japanese a Input Method / Japanese AI Method**
 
-[![Version](https://img.shields.io/badge/Version-1.0.0-blue)](https://github.com/BonoJovi/JaIM/releases)
+[![Version](https://img.shields.io/badge/Version-1.1.0-blue)](https://github.com/BonoJovi/JaIM/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
@@ -17,10 +17,10 @@
 ## 特徴
 
 - **ローマ字変換** — ローマ字入力からひらがな・カタカナへの変換
-- **辞書変換** — IPADIC ベースの 163,000+ エントリ辞書（Trie 検索 + DP 分節）
+- **辞書変換** — IPADIC ベースの 232,000+ エントリ辞書（Trie 検索 + DP 分節）
 - **活用形対応** — 動詞・形容詞の活用形を自動生成（食べた、走って、読んだ 等）
 - **記号入力** — 矢印（やじるし→）、括弧ペア（かっこ→「」）等の記号辞書
-- **LLM リランキング** — Qwen2.5-0.5B による文脈を考慮した候補順位付け
+- **LLM リランキング** — Qwen2.5-0.5B + ローカル HTTP サーバーによる文脈を考慮した候補順位付け（バックグラウンド実行）
 - **文法スコアリング** — 文法ルールによる候補フィルタリング
 - **ユーザ学習** — 選択履歴を学習し、候補順位を最適化
 - **文節編集** — 文節の移動・伸縮・候補切替
@@ -34,11 +34,11 @@
 ```
 キー入力 → ローマ字→かな変換 → 辞書分節 (DP)
                                     ↓
-                            文法スコアリング
+                            文法スコアリング → 候補リスト → ユーザ
+                                    ↓ (バックグラウンド)
+                            LLM リランキング (llama-server HTTP)
                                     ↓
-                            LLM リランキング (Qwen2.5-0.5B)
-                                    ↓
-                            候補リスト → ユーザ
+                            候補順位更新（次回操作時に反映）
 ```
 
 ## コアコンポーネント
@@ -46,9 +46,9 @@
 | コンポーネント | 役割 |
 |----------------|------|
 | **ローマ字変換器** | ASCII → ひらがな / カタカナのステートマシン |
-| **辞書エンジン** | Trie ベースのかな→漢字検索 + DP 分節（163K エントリ） |
+| **辞書エンジン** | Trie ベースのかな→漢字検索 + DP 分節（232K エントリ） |
 | **文法エンジン** | 構造検証とスコアリング（9 ルール） |
-| **LLM エンジン** | Qwen2.5-0.5B (Q4 量子化) による文脈リランキング |
+| **LLM エンジン** | llama-server (HTTP) 経由の Qwen2.5-0.5B によるバックグラウンドリランキング |
 | **ユーザスコアラ** | 選択履歴の対数スケール学習 |
 | **変換エンジン** | パイプライン統合と文節編集 |
 
@@ -71,7 +71,7 @@ JaIM/
       romaji/                # ローマ字→かな変換ステートマシン
       dictionary/            # Trie + DP 分節 + 組み込み辞書 (IPADIC)
       grammar/               # 文法検証
-      llm/                   # ローカル LLM 推論 (llama.cpp バインディング)
+      llm/                   # LLM リランキング (HTTP 経由で llama-server と通信)
       user_scorer.rs         # ユーザ選択履歴学習
     engine/                  # 変換パイプライン統合
     ibus/                    # IBus D-Bus 統合
@@ -88,6 +88,8 @@ JaIM/
     CMakeLists.txt           # Fcitx5 ビルド設定
     jaim-addon.conf          # アドオン記述ファイル
     jaim-im.conf             # 入力メソッド記述ファイル
+  scripts/
+    jaim-llm-server.service  # llama-server 用 systemd ユーザーサービス
   data/
     jaim.xml                 # IBus コンポーネント記述ファイル
 ```
@@ -97,7 +99,7 @@ JaIM/
 - [Rust](https://rustup.rs/)（最新 stable）
 - Linux + IBus または Fcitx5
 - IPADIC 辞書（`sudo apt install mecab-ipadic`）
-- LLM 用: Qwen2.5-0.5B Q4 モデル（約 512MB）を `~/.local/share/jaim/models/` に配置
+- LLM 用（オプション）: llama-server + Qwen2.5-0.5B Q4 モデル（約 512MB）
 
 ## ビルド
 
@@ -107,6 +109,52 @@ cargo run --bin generate-dict
 
 # リリースビルド
 cargo build --release
+```
+
+## LLM サーバーセットアップ（オプション）
+
+LLM リランキングを有効にするには、llama-server をセットアップします。
+LLM サーバーが起動していなくても JaIM は正常に動作します（辞書＋文法＋ユーザ学習のみで変換）。
+
+### 1. llama-server のインストール
+
+[llama.cpp リリースページ](https://github.com/ggml-org/llama.cpp/releases) から Ubuntu x64 バイナリをダウンロード：
+
+```bash
+# ダウンロード・展開
+cd /tmp
+curl -LO https://github.com/ggml-org/llama.cpp/releases/latest/download/llama-<version>-bin-ubuntu-x64.tar.gz
+mkdir llama-extract && cd llama-extract
+tar xzf ../llama-*-bin-ubuntu-x64.tar.gz
+
+# インストール
+mkdir -p ~/.local/bin ~/.local/lib
+cp llama-*/llama-server ~/.local/bin/
+cp llama-*/lib*.so* ~/.local/lib/
+```
+
+### 2. モデルのダウンロード
+
+```bash
+mkdir -p ~/.local/share/jaim/models
+cd ~/.local/share/jaim/models
+curl -LO https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+```
+
+### 3. systemd サービスとして登録
+
+```bash
+mkdir -p ~/.config/systemd/user/
+cp scripts/jaim-llm-server.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now jaim-llm-server
+```
+
+動作確認：
+
+```bash
+curl http://127.0.0.1:8080/health
+# → {"status":"ok"}
 ```
 
 ## インストール
