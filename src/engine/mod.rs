@@ -98,8 +98,17 @@ impl SharedCore {
                     })
                     .unwrap_or_else(UserScorer::new);
 
+                let mut dictionary = Dictionary::new();
+                if let Ok(path) = Dictionary::default_user_dict_path() {
+                    match dictionary.load_user_entries(&path) {
+                        Ok(n) if n > 0 => log::info!("Loaded {} user dictionary entries", n),
+                        Err(e) => log::warn!("Failed to load user dictionary: {}", e),
+                        _ => {}
+                    }
+                }
+
                 Arc::new(SharedCore {
-                    dictionary: Dictionary::new(),
+                    dictionary,
                     grammar: GrammarEngine::new(),
                     llm: Mutex::new(LlmEngine::new()),
                     user_scorer: Mutex::new(user_scorer),
@@ -555,9 +564,19 @@ impl ConversionEngine {
                 });
                 let mut candidates: Vec<String> =
                     entries.iter().map(|e| e.surface.clone()).collect();
-                // Always include the raw reading as a fallback
+                // Always include the raw reading (kana) as a candidate.
+                // Insert at a position based on user learning score so that
+                // frequently selected kana forms can outrank kanji entries.
                 if candidates.is_empty() || !candidates.contains(&seg.reading) {
-                    candidates.push(seg.reading.clone());
+                    let kana_user = user_scorer.score(&seg.reading, &seg.reading);
+                    let kana_score = kana_user * 2.0 + 0.1; // small base + user learning
+                    let insert_pos = entries
+                        .iter()
+                        .position(|e| {
+                            Self::effective_score_with(&user_scorer, &seg.reading, e) < kana_score
+                        })
+                        .unwrap_or(candidates.len());
+                    candidates.insert(insert_pos, seg.reading.clone());
                 }
                 SegmentState {
                     reading: seg.reading.clone(),
@@ -751,11 +770,19 @@ impl ConversionEngine {
             let score_b = Self::effective_score_with(&user_scorer, &reading, b);
             score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
         });
-        drop(user_scorer);
         let mut candidates: Vec<String> = entries.iter().map(|e| e.surface.clone()).collect();
         if candidates.is_empty() || !candidates.contains(&reading) {
-            candidates.push(reading);
+            let kana_user = user_scorer.score(&reading, &reading);
+            let kana_score = kana_user * 2.0 + 0.1;
+            let insert_pos = entries
+                .iter()
+                .position(|e| {
+                    Self::effective_score_with(&user_scorer, &reading, e) < kana_score
+                })
+                .unwrap_or(candidates.len());
+            candidates.insert(insert_pos, reading);
         }
+        drop(user_scorer);
         if let Some(state) = self.conversion.as_mut() {
             state.segments[idx].candidates = candidates;
             state.segments[idx].selected = 0;
