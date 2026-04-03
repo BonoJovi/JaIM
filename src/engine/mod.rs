@@ -162,6 +162,11 @@ impl ConversionEngine {
 
         let user_scorer = self.shared.user_scorer.lock().unwrap();
         let segments = self.shared.dictionary.segment_with_boost(&kana, |reading, entries| {
+            // Don't boost single-char segments — learned single-kana scores (の, が, い...)
+            // are very high and distort segmentation by encouraging excessive splitting.
+            if reading.chars().count() <= 1 {
+                return 0.0;
+            }
             entries
                 .iter()
                 .map(|e| user_scorer.score(reading, &e.surface))

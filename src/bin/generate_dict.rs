@@ -114,7 +114,7 @@ fn main() {
                 let dominated_by_kana = parsed.entry.surface == parsed.entry.reading;
                 if !dominated_by_kana
                     && matches!(parsed.entry.pos, "Verb" | "Adjective")
-                    && matches!(parsed.conjugation_form.as_str(), "連用タ接続" | "連用形")
+                    && matches!(parsed.conjugation_form.as_str(), "連用タ接続" | "連用形" | "未然形")
                 {
                     parsed_for_compounds.push(ParsedEntry {
                         entry: parsed.entry.clone(),
@@ -207,9 +207,11 @@ fn parse_line(line: &str, source: &DictSource) -> Option<ParsedEntry> {
     let reading = katakana_to_hiragana(reading_katakana);
 
     // Skip if surface == reading (pure kana words add no value for kana→kanji conversion)
-    // Exception: keep functional words and verb/adjective conjugations
+    // Exception: keep functional words, verb/adjective conjugations, and pronouns
     // as they are needed for segmentation even without kanji conversion
+    let is_pronoun = pos_major == "名詞" && pos_sub == "代名詞";
     let dominated_by_kana = surface == reading
+        && !is_pronoun
         && !matches!(
             pos_major,
             "助詞" | "助動詞" | "接続詞" | "副詞" | "感動詞" | "連体詞" | "動詞" | "形容詞"
@@ -230,8 +232,9 @@ fn parse_line(line: &str, source: &DictSource) -> Option<ParsedEntry> {
     // Map POS
     let pos = map_pos(pos_major, pos_sub);
 
-    // Convert cost to frequency (lower cost = more common)
-    let frequency = cost_to_frequency(cost);
+    // Convert cost to frequency (lower cost = more common), then adjust by POS
+    let raw_frequency = cost_to_frequency(cost);
+    let frequency = adjust_frequency(raw_frequency, surface, pos_major, pos_sub);
 
     Some(ParsedEntry {
         entry: Entry {
@@ -250,10 +253,16 @@ fn parse_line(line: &str, source: &DictSource) -> Option<ParsedEntry> {
 /// For each 連用タ接続 stem, generates:
 ///   stem + た/だ (past tense, e.g., 食べた, 読んだ)
 ///   stem + て/で (te-form, e.g., 食べて, 読んで)
+///   stem + ている/でいる (progressive, e.g., 食べている, 読んでいる)
+///   stem + ています/でいます (polite progressive, e.g., 食べています)
 ///
 /// For each 連用形 stem of ichidan-type verbs, generates:
-///   stem + た (past tense, e.g., 食べた)
-///   stem + て (te-form, e.g., 食べて)
+///   stem + た/て (past/te-form, e.g., 食べた, 食べて)
+///   stem + ている/ています (progressive)
+///
+/// For each 未然形 stem, generates passive/potential forms:
+///   stem + れる/れた/れて (godan passive, e.g., 書かれる)
+///   stem + られる/られた/られて (ichidan passive, e.g., 食べられる)
 fn generate_compounds(parsed: &[ParsedEntry]) -> Vec<Entry> {
     let mut compounds = Vec::new();
 
@@ -261,42 +270,87 @@ fn generate_compounds(parsed: &[ParsedEntry]) -> Vec<Entry> {
         let ctype = p.conjugation_type.as_str();
         let cform = p.conjugation_form.as_str();
 
-        // Determine which auxiliaries to append
-        let suffixes: &[(&str, &str)] = match cform {
+        match cform {
             "連用タ接続" => {
                 // Voiced consonant stems (ガ/バ/マ/ナ行) take だ/で
-                if VOICED_CONJUGATION_TYPES.iter().any(|&v| ctype.starts_with(v)) {
-                    &[("だ", "だ"), ("で", "で")]
-                } else {
-                    &[("た", "た"), ("て", "て")]
+                let is_voiced =
+                    VOICED_CONJUGATION_TYPES.iter().any(|&v| ctype.starts_with(v));
+                let (ta, te) = if is_voiced { ("だ", "で") } else { ("た", "て") };
+
+                let boosted = boost_freq(p.entry.frequency);
+
+                // Past and te-form
+                for &suffix in &[ta, te] {
+                    compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
+                }
+                // Progressive: て+いる, て+いた, て+いない, て+います
+                for &(r_suf, s_suf) in &[
+                    (te, te),  // already added above, skip
+                ] {
+                    let _ = (r_suf, s_suf); // placeholder
+                }
+                let te_progressive: &[(&str, &str)] = &[
+                    (&format!("{}いる", te), &format!("{}いる", te)),
+                    (&format!("{}いた", te), &format!("{}いた", te)),
+                    (&format!("{}いない", te), &format!("{}いない", te)),
+                    (&format!("{}います", te), &format!("{}います", te)),
+                ];
+                for (r_suf, s_suf) in te_progressive {
+                    compounds.push(Entry {
+                        reading: format!("{}{}", p.entry.reading, r_suf),
+                        surface: format!("{}{}", p.entry.surface, s_suf),
+                        pos: p.entry.pos,
+                        frequency: boosted,
+                    });
                 }
             }
             "連用形" => {
                 // Only ichidan-style verbs form past/te directly from 連用形
-                if ICHIDAN_TYPES.iter().any(|&t| ctype.starts_with(t)) {
-                    &[("た", "た"), ("て", "て")]
-                } else {
+                if !ICHIDAN_TYPES.iter().any(|&t| ctype.starts_with(t)) {
                     continue;
+                }
+                let boosted = boost_freq(p.entry.frequency);
+                for &suffix in &["た", "て"] {
+                    compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
+                }
+                // Progressive forms
+                for &suffix in &["ている", "ていた", "ていない", "ています"] {
+                    compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
+                }
+            }
+            "未然形" => {
+                // Passive/potential forms
+                let boosted = boost_freq(p.entry.frequency);
+                if ICHIDAN_TYPES.iter().any(|&t| ctype.starts_with(t)) {
+                    // Ichidan: stem + られる/られた/られて
+                    for &suffix in &["られる", "られた", "られて", "られない"] {
+                        compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
+                    }
+                } else if ctype.starts_with("五段") {
+                    // Godan: stem + れる/れた/れて (未然形 already ends with あ-row)
+                    for &suffix in &["れる", "れた", "れて", "れない"] {
+                        compounds.push(make_compound(&p.entry, suffix, suffix, boosted));
+                    }
                 }
             }
             _ => continue,
-        };
-
-        for &(reading_suffix, surface_suffix) in suffixes {
-            // Boost compound frequency: conjugated forms (食べた, 走った) are at least
-            // as common as their stems, but IPADIC stems have lower frequency.
-            // Without boost, high-frequency short words (他+ベタ) beat compounds (食べた).
-            let boosted_freq = (p.entry.frequency as f64 * 2.0).min(20000.0) as u32;
-            compounds.push(Entry {
-                reading: format!("{}{}", p.entry.reading, reading_suffix),
-                surface: format!("{}{}", p.entry.surface, surface_suffix),
-                pos: p.entry.pos,
-                frequency: boosted_freq,
-            });
         }
     }
 
     compounds
+}
+
+fn boost_freq(frequency: u32) -> u32 {
+    (frequency as f64 * 2.0).min(20000.0) as u32
+}
+
+fn make_compound(base: &Entry, reading_suffix: &str, surface_suffix: &str, freq: u32) -> Entry {
+    Entry {
+        reading: format!("{}{}", base.reading, reading_suffix),
+        surface: format!("{}{}", base.surface, surface_suffix),
+        pos: base.pos,
+        frequency: freq,
+    }
 }
 
 /// Convert katakana string to hiragana.
@@ -344,6 +398,62 @@ fn map_pos(major: &str, sub: &str) -> &'static str {
 fn cost_to_frequency(cost: i32) -> u32 {
     let freq = 10000 - cost;
     freq.clamp(1, 20000) as u32
+}
+
+/// Adjust frequency based on POS and surface characteristics.
+///
+/// IPADIC cost values don't always reflect practical input frequency.
+/// For example, particles (に, は, が) are the most frequent words in
+/// Japanese text but have relatively high IPADIC cost.  Conversely,
+/// katakana-only nouns (テキ, タイ) rarely appear in typical kana input.
+fn adjust_frequency(frequency: u32, surface: &str, pos_major: &str, pos_sub: &str) -> u32 {
+    let freq = frequency as f64;
+    let adjusted = match pos_major {
+        // Particles (に, は, が, を, で, etc.) — most frequent in running text
+        "助詞" => freq * 1.6,
+        // Auxiliaries (です, ます, た, etc.)
+        "助動詞" => freq * 1.4,
+        // Adverbs: boost kana-surface adverbs (うまく, たぶん, やはり) that lose
+        // to single-kanji splits.  Skip kanji-surface adverbs (依然, 全然)
+        // which are already high-freq and break segmentation when boosted.
+        "副詞" => {
+            let has_kanji = surface.chars().any(|c| {
+                ('\u{4E00}'..='\u{9FFF}').contains(&c)
+                    || ('\u{3400}'..='\u{4DBF}').contains(&c)
+            });
+            if has_kanji { freq } else { freq * 1.4 }
+        }
+        // Verbs: する/し/して etc. have very high IPADIC cost despite being
+        // the most common verbs in Japanese.  Boost kana-only verb surfaces.
+        "動詞" => {
+            let all_kana = !surface.is_empty()
+                && surface.chars().all(|c| {
+                    ('\u{3040}'..='\u{309F}').contains(&c)  // hiragana
+                    || ('\u{30A0}'..='\u{30FF}').contains(&c) // katakana
+                });
+            if all_kana { (freq * 1.5).min(8000.0) } else { freq }
+        }
+        // Suffixes (的, 性, 化, etc.) — very common in compounds
+        "名詞" if pos_sub == "接尾" => freq * 1.4,
+        // Pronouns (これ, それ, あれ, etc.) — very common, need segmentation presence
+        "名詞" if pos_sub == "代名詞" => freq * 1.5,
+        // Number kanji (二, 三, etc.) — rarely typed as kanji via kana
+        "名詞" if pos_sub == "数" => {
+            let is_kanji = surface.chars().all(|c| {
+                ('\u{4E00}'..='\u{9FFF}').contains(&c)
+                    || ('\u{3400}'..='\u{4DBF}').contains(&c)
+            });
+            if is_kanji { freq * 0.5 } else { freq }
+        }
+        // Katakana-only nouns (テキ, タイ, etc.) — demote
+        "名詞" => {
+            let all_katakana = !surface.is_empty()
+                && surface.chars().all(|c| ('\u{30A1}'..='\u{30F6}').contains(&c) || c == 'ー');
+            if all_katakana { freq * 0.5 } else { freq }
+        }
+        _ => freq,
+    };
+    (adjusted as u32).clamp(1, 20000)
 }
 
 /// Write the generated builtin_dict.rs file.

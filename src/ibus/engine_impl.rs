@@ -408,8 +408,7 @@ impl JaimEngine {
         &self,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) {
-        info!("JaIM: FocusIn");
-        *self.enabled.lock().unwrap() = true;
+        info!("JaIM: FocusIn (enabled={})", *self.enabled.lock().unwrap());
         if let Err(e) = self.register_menu(&emitter).await {
             warn!("JaIM: Failed to register properties: {}", e);
         }
@@ -454,8 +453,7 @@ impl JaimEngine {
 
     /// Enable the engine.
     async fn enable(&self) {
-        info!("JaIM: Enable");
-        *self.enabled.lock().unwrap() = true;
+        info!("JaIM: Enable (enabled={})", *self.enabled.lock().unwrap());
     }
 
     /// Disable the engine.
