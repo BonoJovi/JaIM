@@ -437,6 +437,16 @@ fn adjust_frequency(frequency: u32, surface: &str, pos_major: &str, pos_sub: &st
         "名詞" if pos_sub == "接尾" => freq * 1.4,
         // Pronouns (これ, それ, あれ, etc.) — very common, need segmentation presence
         "名詞" if pos_sub == "代名詞" => freq * 1.5,
+        // サ変接続 nouns (換字, 自書, etc.) — IPADIC gives them lower cost than
+        // common nouns (漢字, 辞書), which is backwards for typical input.
+        "名詞" if pos_sub == "サ変接続" => freq * 0.8,
+        // 副詞可能 nouns (後, 前, 時, 上, 間, etc.) — IPADIC gives them very
+        // high cost (often > 10000 → freq=1), but they are common everyday words.
+        // Use a floor + boost to keep them competitive with general nouns.
+        "名詞" if pos_sub == "副詞可能" => {
+            let floored = freq.max(4500.0);
+            floored * 1.1
+        }
         // Number kanji (二, 三, etc.) — rarely typed as kanji via kana
         "名詞" if pos_sub == "数" => {
             let is_kanji = surface.chars().all(|c| {

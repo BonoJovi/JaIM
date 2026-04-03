@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::core::{
-    dictionary::{Dictionary, DictionaryEntry, Segment},
+    dictionary::{Dictionary, DictionaryEntry, PartOfSpeech, Segment},
     grammar::{GrammarEngine, GrammarToken},
     llm::LlmEngine,
     romaji::RomajiConverter,
@@ -550,12 +550,44 @@ impl ConversionEngine {
             .collect()
     }
 
-    /// Compute effective score combining dictionary frequency and user learning.
-    /// User learning is additive: even one selection gives a significant boost.
+    /// Compute effective score combining dictionary frequency, user learning,
+    /// and surface-form adjustments.
     fn effective_score_with(user_scorer: &UserScorer, reading: &str, entry: &DictionaryEntry) -> f64 {
         let freq_norm = (entry.frequency as f64) / 10000.0;
         let user = user_scorer.score(reading, &entry.surface);
-        freq_norm + user * 2.0
+
+        // Surface-form adjustments to correct IPADIC frequency biases
+        let surface_adj = Self::surface_adjustment(reading, &entry.surface, entry.pos);
+
+        freq_norm + user * 2.0 + surface_adj
+    }
+
+    /// Adjustment based on surface form characteristics.
+    /// Returns a bonus (positive) or penalty (negative) added to the effective score.
+    fn surface_adjustment(reading: &str, surface: &str, pos: PartOfSpeech) -> f64 {
+        // Katakana-only surfaces are rarely the desired conversion in normal text.
+        // e.g. イイ(いい), テキ(てき), タイ(たい) — demote significantly.
+        let all_katakana = !surface.is_empty()
+            && surface.chars().all(|c| {
+                ('\u{30A1}'..='\u{30F6}').contains(&c) || c == 'ー'
+            });
+        if all_katakana && surface != reading {
+            return -0.3;
+        }
+
+        // If surface exactly matches reading (kana-only), give a small boost
+        // for functional words — they are often the correct choice.
+        // e.g. これ, それ, いる, する, いい
+        if surface == reading {
+            return match pos {
+                PartOfSpeech::Particle | PartOfSpeech::Auxiliary => 0.2,
+                PartOfSpeech::Verb | PartOfSpeech::Adjective | PartOfSpeech::Adverb => 0.15,
+                PartOfSpeech::Noun => 0.1,  // pronouns are Noun
+                _ => 0.0,
+            };
+        }
+
+        0.0
     }
 
     /// Re-lookup candidates for a segment after its reading changed.
