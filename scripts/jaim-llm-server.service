@@ -1,0 +1,13 @@
+[Unit]
+Description=JaIM LLM Server (llama-server for Japanese IME)
+After=network.target
+
+[Service]
+Type=simple
+Environment=LD_LIBRARY_PATH=%h/.local/lib
+ExecStart=%h/.local/bin/llama-server -m %h/.local/share/jaim/models/qwen2.5-0.5b-instruct-q4_k_m.gguf --host 127.0.0.1 --port 8080 --ctx-size 512 --threads 2 -ngl 0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

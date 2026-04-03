@@ -134,6 +134,11 @@ fn main() {
     eprintln!("Generated {} compound entries", compounds.len());
     entries.extend(compounds);
 
+    // Manual extra entries (single kanji etc. missing from IPADIC)
+    let extras = extra_entries();
+    eprintln!("Added {} manual extra entries", extras.len());
+    entries.extend(extras);
+
     eprintln!("Total before dedup: {}", entries.len());
 
     // Deduplicate: same reading+surface+pos → keep highest frequency
@@ -464,6 +469,24 @@ fn adjust_frequency(frequency: u32, surface: &str, pos_major: &str, pos_sub: &st
         _ => freq,
     };
     (adjusted as u32).clamp(1, 20000)
+}
+
+/// Manual extra entries for kanji/words missing from IPADIC.
+/// Add entries here as needed for single kanji or common words.
+fn extra_entries() -> Vec<Entry> {
+    let extras: &[(&str, &str, &str, u32)] = &[
+        // (reading, surface, pos, frequency)
+        ("ご", "誤", "Noun", 5000),
+    ];
+    extras
+        .iter()
+        .map(|(reading, surface, pos, freq)| Entry {
+            reading: reading.to_string(),
+            surface: surface.to_string(),
+            pos,
+            frequency: *freq,
+        })
+        .collect()
 }
 
 /// Write the generated builtin_dict.rs file.

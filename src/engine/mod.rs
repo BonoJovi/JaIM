@@ -9,6 +9,7 @@
 ///       → LLM rerank → candidate list → user selects → commit
 
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 use crate::core::{
     dictionary::{Dictionary, DictionaryEntry, PartOfSpeech, Segment},
@@ -109,11 +110,16 @@ impl SharedCore {
     }
 }
 
+/// Result of background LLM reranking: reranked candidate lists per segment.
+type LlmRerankResult = Vec<Vec<String>>;
+
 pub struct ConversionEngine {
     romaji: RomajiConverter,
     shared: Arc<SharedCore>,
     /// Active conversion state (None when not converting)
     conversion: Option<ConversionState>,
+    /// Background LLM reranking result (populated asynchronously)
+    llm_rerank_result: Arc<Mutex<Option<LlmRerankResult>>>,
 }
 
 impl ConversionEngine {
@@ -122,6 +128,7 @@ impl ConversionEngine {
             romaji: RomajiConverter::new(),
             shared: SharedCore::global(),
             conversion: None,
+            llm_rerank_result: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -184,6 +191,10 @@ impl ConversionEngine {
             segments: segment_states,
             focus: 0,
         });
+
+        // Trigger LLM reranking in background — results applied on next interaction
+        self.trigger_llm_rerank();
+
         self.conversion.as_ref()
     }
 
@@ -475,7 +486,10 @@ impl ConversionEngine {
 
     /// Commit the selected candidate and update context.
     pub fn commit(&mut self, candidate: &str) -> String {
-        self.shared.llm.lock().unwrap().update_context(candidate);
+        match self.shared.llm.try_lock() {
+            Ok(mut llm) => llm.update_context(candidate),
+            Err(_) => log::debug!("LLM lock busy during commit, skipping context update"),
+        }
         self.romaji.reset();
         candidate.to_string()
     }
@@ -504,7 +518,12 @@ impl ConversionEngine {
             }
         }
 
-        self.shared.llm.lock().unwrap().update_context(&text);
+        // Use try_lock to avoid blocking if LLM background thread holds the lock.
+        // If we can't acquire the lock now, update context on next available opportunity.
+        match self.shared.llm.try_lock() {
+            Ok(mut llm) => llm.update_context(&text),
+            Err(_) => log::debug!("LLM lock busy during commit, skipping context update"),
+        }
         self.romaji.reset();
         Some(text)
     }
@@ -522,6 +541,7 @@ impl ConversionEngine {
 
     /// Build SegmentState list from dictionary Segments.
     /// Candidates are ordered by effective score (dictionary frequency + user learning).
+    /// LLM reranking is triggered separately in the background.
     fn build_segment_states(&self, segments: &[Segment]) -> Vec<SegmentState> {
         let user_scorer = self.shared.user_scorer.lock().unwrap();
         segments
@@ -548,6 +568,134 @@ impl ConversionEngine {
                 }
             })
             .collect()
+    }
+
+    /// Trigger background LLM reranking for the current conversion state.
+    /// Results are stored in `llm_rerank_result` and can be applied later.
+    fn trigger_llm_rerank(&self) {
+        let state = match self.conversion.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Collect segment info needed for background scoring
+        let seg_info: Vec<(String, Vec<String>)> = state
+            .segments
+            .iter()
+            .map(|seg| (seg.reading.clone(), seg.candidates.clone()))
+            .collect();
+
+        let shared = self.shared.clone();
+        let result_slot = self.llm_rerank_result.clone();
+
+        // Clear previous result
+        *result_slot.lock().unwrap() = None;
+
+        thread::spawn(move || {
+            // Catch any panics to prevent crashing the IBus process
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let llm = shared.llm.lock().unwrap();
+                let committed_context = llm.context().to_string();
+                // running_context accumulates chosen candidates as we go through segments.
+                // Start empty — committed_context is passed separately to score_with_context.
+                let mut preceding_text = String::new();
+
+                const LLM_RERANK_TOP_N: usize = 5;
+                let mut reranked_segments: Vec<Vec<String>> = Vec::new();
+
+                for (reading, candidates) in &seg_info {
+                    if candidates.len() > 1 && reading.chars().count() >= 2 {
+                        let rerank_count = candidates.len().min(LLM_RERANK_TOP_N);
+                        // Context = committed text + preceding segments' chosen candidates
+                        let context = format!("{}{}", committed_context, preceding_text);
+                        let mut top_with_scores: Vec<(usize, f64)> = (0..rerank_count)
+                            .map(|i| {
+                                let llm_score =
+                                    llm.score_with_context(&context, &candidates[i]);
+                                let rank_base =
+                                    1.0 - (i as f64 / rerank_count as f64) * 0.3;
+                                let combined = rank_base * 0.4 + llm_score * 0.6;
+                                (i, combined)
+                            })
+                            .collect();
+                        top_with_scores.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+
+                        let mut reranked: Vec<String> = top_with_scores
+                            .iter()
+                            .map(|(idx, _)| candidates[*idx].clone())
+                            .collect();
+                        reranked.extend(candidates[rerank_count..].iter().cloned());
+
+                        log::debug!(
+                            "LLM rerank segment '{}': top='{}'",
+                            reading,
+                            reranked[0],
+                        );
+
+                        preceding_text.push_str(&reranked[0]);
+                        reranked_segments.push(reranked);
+                    } else {
+                        preceding_text.push_str(&candidates[0]);
+                        reranked_segments.push(candidates.clone());
+                    }
+                }
+
+                reranked_segments
+            }));
+
+            match result {
+                Ok(reranked) => {
+                    *result_slot.lock().unwrap() = Some(reranked);
+                    log::info!("LLM background reranking complete");
+                }
+                Err(_) => {
+                    log::warn!("LLM background reranking panicked, discarding results");
+                }
+            }
+        });
+    }
+
+    /// Apply LLM reranking results if available.
+    /// Returns true if candidates were updated.
+    pub fn apply_llm_rerank(&mut self) -> bool {
+        let reranked = {
+            let mut slot = self.llm_rerank_result.lock().unwrap();
+            slot.take()
+        };
+
+        let reranked = match reranked {
+            Some(r) => r,
+            None => return false,
+        };
+
+        let state = match self.conversion.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let mut updated = false;
+        for (seg, new_candidates) in state.segments.iter_mut().zip(reranked.into_iter()) {
+            // Don't override if user already manually selected a candidate
+            if seg.user_selected {
+                continue;
+            }
+            if seg.candidates != new_candidates {
+                seg.candidates = new_candidates;
+                seg.selected = 0;
+                updated = true;
+            }
+        }
+        if updated {
+            log::info!("LLM reranking applied to conversion state");
+        }
+        updated
+    }
+
+    /// Check if LLM reranking results are ready (non-blocking).
+    pub fn has_llm_rerank_result(&self) -> bool {
+        self.llm_rerank_result.lock().unwrap().is_some()
     }
 
     /// Compute effective score combining dictionary frequency, user learning,
