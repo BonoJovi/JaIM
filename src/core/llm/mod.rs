@@ -8,7 +8,7 @@
 /// Runs on a background thread with KV cache pre-warming
 /// to minimize latency at conversion time.
 
-mod llama_scorer;
+mod http_scorer;
 
 /// Trait defining the LLM scoring interface.
 /// Allows swapping between mock and real implementations.
@@ -21,7 +21,7 @@ pub trait LlmScorer: Send + Sync {
     fn warm_cache(&self, context: &str);
 }
 
-pub use llama_scorer::LlamaScorer;
+pub use http_scorer::HttpLlamaScorer;
 
 /// LLM engine that uses a pluggable scorer for candidate reranking.
 pub struct LlmEngine {
@@ -32,15 +32,15 @@ pub struct LlmEngine {
 
 impl LlmEngine {
     /// Create with the best available scorer.
-    /// Uses LlamaScorer if the GGUF model is found, otherwise falls back to MockScorer.
+    /// Tries HTTP llama-server first, falls back to MockScorer.
     pub fn new() -> Self {
-        let scorer: Box<dyn LlmScorer> = match LlamaScorer::from_default_path() {
+        let scorer: Box<dyn LlmScorer> = match HttpLlamaScorer::from_default_endpoint() {
             Some(s) => {
-                log::info!("LlmEngine: using real LlamaScorer");
+                log::info!("LlmEngine: using HttpLlamaScorer");
                 Box::new(s)
             }
             None => {
-                log::info!("LlmEngine: no model found, using MockScorer");
+                log::info!("LlmEngine: no LLM server available, using MockScorer");
                 Box::new(MockScorer)
             }
         };
@@ -73,6 +73,11 @@ impl LlmEngine {
     /// Score a candidate sentence for contextual naturalness.
     pub fn score_candidate(&self, candidate: &str) -> f64 {
         self.scorer.score(&self.context, candidate)
+    }
+
+    /// Score a candidate with explicit context (for background reranking).
+    pub fn score_with_context(&self, context: &str, candidate: &str) -> f64 {
+        self.scorer.score(context, candidate)
     }
 
     /// Rerank candidates by contextual naturalness.
@@ -174,9 +179,14 @@ fn is_hiragana(c: char) -> bool {
 mod tests {
     use super::*;
 
+    /// Create a test engine with MockScorer (deterministic, no server dependency).
+    fn mock_engine() -> LlmEngine {
+        LlmEngine::with_scorer(Box::new(MockScorer))
+    }
+
     #[test]
     fn mock_scorer_prefers_kanji() {
-        let engine = LlmEngine::new();
+        let engine = mock_engine();
         let kanji_score = engine.score_candidate("今日");
         let hira_score = engine.score_candidate("きょう");
         assert!(kanji_score > hira_score);
@@ -184,7 +194,7 @@ mod tests {
 
     #[test]
     fn mock_scorer_penalizes_single_char() {
-        let engine = LlmEngine::new();
+        let engine = mock_engine();
         let long_score = engine.score_candidate("天気");
         let short_score = engine.score_candidate("て");
         assert!(long_score > short_score);
@@ -192,7 +202,7 @@ mod tests {
 
     #[test]
     fn rerank_orders_by_score() {
-        let engine = LlmEngine::new();
+        let engine = mock_engine();
         let candidates = vec![
             "きょう".to_string(),   // all hiragana
             "今日".to_string(),     // kanji
@@ -204,14 +214,14 @@ mod tests {
 
     #[test]
     fn rerank_empty() {
-        let engine = LlmEngine::new();
+        let engine = mock_engine();
         let ranked = engine.rerank(&[]);
         assert!(ranked.is_empty());
     }
 
     #[test]
     fn context_update() {
-        let mut engine = LlmEngine::new();
+        let mut engine = mock_engine();
         engine.update_context("今日は");
         engine.update_context("天気が");
         assert_eq!(engine.context(), "今日は天気が");
@@ -219,7 +229,7 @@ mod tests {
 
     #[test]
     fn context_truncation() {
-        let mut engine = LlmEngine::new();
+        let mut engine = mock_engine();
         // Push a lot of text
         for _ in 0..100 {
             engine.update_context("あいうえおかきくけこ");
@@ -244,19 +254,18 @@ mod tests {
 
     #[test]
     fn homophone_disambiguation() {
-        let engine = LlmEngine::new();
+        let engine = mock_engine();
         // 雨 vs 飴 — both are valid for あめ
         // Mock should prefer the kanji version equally, but both are kanji
         let ame_rain = engine.score_candidate("雨");
         let ame_candy = engine.score_candidate("飴");
         // Both are single kanji, so similar scores
         assert!((ame_rain - ame_candy).abs() < 0.01);
-        // When real LLM is integrated, context like "今日は" would prefer 雨
     }
 
     #[test]
     fn mixed_kanji_hiragana_scoring() {
-        let engine = LlmEngine::new();
+        let engine = mock_engine();
         // 食べる (kanji+hiragana) vs たべる (all hiragana)
         let mixed = engine.score_candidate("食べる");
         let hira = engine.score_candidate("たべる");

@@ -376,12 +376,9 @@ impl Dictionary {
 }
 
 /// Cost function for segmentation DP.
-/// Lower cost = better. Multiplies frequency contribution by character length
-/// so that longer high-frequency words strongly outweigh multiple short words,
-/// while longer low-frequency words lose to common short-word splits.
-/// so that longer high-frequency words strongly outweigh multiple short words,
-/// while longer low-frequency words lose to common short-word splits.
-/// A small per-segment overhead (+1.0) prevents splitting short compounds.
+/// Lower cost = better.  The char_len multiplier makes longer words accumulate
+/// more frequency benefit, while the +1.0 per-segment penalty discourages
+/// excessive splitting.
 fn segment_cost(char_len: usize, frequency: u32) -> f64 {
     (char_len as f64) * -(frequency as f64).ln() + 1.0
 }

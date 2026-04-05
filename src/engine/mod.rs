@@ -9,9 +9,10 @@
 ///       → LLM rerank → candidate list → user selects → commit
 
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 use crate::core::{
-    dictionary::{Dictionary, DictionaryEntry, Segment},
+    dictionary::{Dictionary, DictionaryEntry, PartOfSpeech, Segment},
     grammar::{GrammarEngine, GrammarToken},
     llm::LlmEngine,
     romaji::RomajiConverter,
@@ -97,8 +98,17 @@ impl SharedCore {
                     })
                     .unwrap_or_else(UserScorer::new);
 
+                let mut dictionary = Dictionary::new();
+                if let Ok(path) = Dictionary::default_user_dict_path() {
+                    match dictionary.load_user_entries(&path) {
+                        Ok(n) if n > 0 => log::info!("Loaded {} user dictionary entries", n),
+                        Err(e) => log::warn!("Failed to load user dictionary: {}", e),
+                        _ => {}
+                    }
+                }
+
                 Arc::new(SharedCore {
-                    dictionary: Dictionary::new(),
+                    dictionary,
                     grammar: GrammarEngine::new(),
                     llm: Mutex::new(LlmEngine::new()),
                     user_scorer: Mutex::new(user_scorer),
@@ -109,11 +119,16 @@ impl SharedCore {
     }
 }
 
+/// Result of background LLM reranking: reranked candidate lists per segment.
+type LlmRerankResult = Vec<Vec<String>>;
+
 pub struct ConversionEngine {
     romaji: RomajiConverter,
     shared: Arc<SharedCore>,
     /// Active conversion state (None when not converting)
     conversion: Option<ConversionState>,
+    /// Background LLM reranking result (populated asynchronously)
+    llm_rerank_result: Arc<Mutex<Option<LlmRerankResult>>>,
 }
 
 impl ConversionEngine {
@@ -122,6 +137,7 @@ impl ConversionEngine {
             romaji: RomajiConverter::new(),
             shared: SharedCore::global(),
             conversion: None,
+            llm_rerank_result: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -162,6 +178,11 @@ impl ConversionEngine {
 
         let user_scorer = self.shared.user_scorer.lock().unwrap();
         let segments = self.shared.dictionary.segment_with_boost(&kana, |reading, entries| {
+            // Don't boost single-char segments — learned single-kana scores (の, が, い...)
+            // are very high and distort segmentation by encouraging excessive splitting.
+            if reading.chars().count() <= 1 {
+                return 0.0;
+            }
             entries
                 .iter()
                 .map(|e| user_scorer.score(reading, &e.surface))
@@ -179,6 +200,10 @@ impl ConversionEngine {
             segments: segment_states,
             focus: 0,
         });
+
+        // Trigger LLM reranking in background — results applied on next interaction
+        self.trigger_llm_rerank();
+
         self.conversion.as_ref()
     }
 
@@ -470,7 +495,10 @@ impl ConversionEngine {
 
     /// Commit the selected candidate and update context.
     pub fn commit(&mut self, candidate: &str) -> String {
-        self.shared.llm.lock().unwrap().update_context(candidate);
+        match self.shared.llm.try_lock() {
+            Ok(mut llm) => llm.update_context(candidate),
+            Err(_) => log::debug!("LLM lock busy during commit, skipping context update"),
+        }
         self.romaji.reset();
         candidate.to_string()
     }
@@ -499,7 +527,12 @@ impl ConversionEngine {
             }
         }
 
-        self.shared.llm.lock().unwrap().update_context(&text);
+        // Use try_lock to avoid blocking if LLM background thread holds the lock.
+        // If we can't acquire the lock now, update context on next available opportunity.
+        match self.shared.llm.try_lock() {
+            Ok(mut llm) => llm.update_context(&text),
+            Err(_) => log::debug!("LLM lock busy during commit, skipping context update"),
+        }
         self.romaji.reset();
         Some(text)
     }
@@ -517,6 +550,7 @@ impl ConversionEngine {
 
     /// Build SegmentState list from dictionary Segments.
     /// Candidates are ordered by effective score (dictionary frequency + user learning).
+    /// LLM reranking is triggered separately in the background.
     fn build_segment_states(&self, segments: &[Segment]) -> Vec<SegmentState> {
         let user_scorer = self.shared.user_scorer.lock().unwrap();
         segments
@@ -530,9 +564,19 @@ impl ConversionEngine {
                 });
                 let mut candidates: Vec<String> =
                     entries.iter().map(|e| e.surface.clone()).collect();
-                // Always include the raw reading as a fallback
+                // Always include the raw reading (kana) as a candidate.
+                // Insert at a position based on user learning score so that
+                // frequently selected kana forms can outrank kanji entries.
                 if candidates.is_empty() || !candidates.contains(&seg.reading) {
-                    candidates.push(seg.reading.clone());
+                    let kana_user = user_scorer.score(&seg.reading, &seg.reading);
+                    let kana_score = kana_user * 2.0 + 0.1; // small base + user learning
+                    let insert_pos = entries
+                        .iter()
+                        .position(|e| {
+                            Self::effective_score_with(&user_scorer, &seg.reading, e) < kana_score
+                        })
+                        .unwrap_or(candidates.len());
+                    candidates.insert(insert_pos, seg.reading.clone());
                 }
                 SegmentState {
                     reading: seg.reading.clone(),
@@ -545,12 +589,172 @@ impl ConversionEngine {
             .collect()
     }
 
-    /// Compute effective score combining dictionary frequency and user learning.
-    /// User learning is additive: even one selection gives a significant boost.
+    /// Trigger background LLM reranking for the current conversion state.
+    /// Results are stored in `llm_rerank_result` and can be applied later.
+    fn trigger_llm_rerank(&self) {
+        let state = match self.conversion.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Collect segment info needed for background scoring
+        let seg_info: Vec<(String, Vec<String>)> = state
+            .segments
+            .iter()
+            .map(|seg| (seg.reading.clone(), seg.candidates.clone()))
+            .collect();
+
+        let shared = self.shared.clone();
+        let result_slot = self.llm_rerank_result.clone();
+
+        // Clear previous result
+        *result_slot.lock().unwrap() = None;
+
+        thread::spawn(move || {
+            // Catch any panics to prevent crashing the IBus process
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let llm = shared.llm.lock().unwrap();
+                let committed_context = llm.context().to_string();
+                // running_context accumulates chosen candidates as we go through segments.
+                // Start empty — committed_context is passed separately to score_with_context.
+                let mut preceding_text = String::new();
+
+                const LLM_RERANK_TOP_N: usize = 5;
+                let mut reranked_segments: Vec<Vec<String>> = Vec::new();
+
+                for (reading, candidates) in &seg_info {
+                    if candidates.len() > 1 && reading.chars().count() >= 2 {
+                        let rerank_count = candidates.len().min(LLM_RERANK_TOP_N);
+                        // Context = committed text + preceding segments' chosen candidates
+                        let context = format!("{}{}", committed_context, preceding_text);
+                        let mut top_with_scores: Vec<(usize, f64)> = (0..rerank_count)
+                            .map(|i| {
+                                let llm_score =
+                                    llm.score_with_context(&context, &candidates[i]);
+                                let rank_base =
+                                    1.0 - (i as f64 / rerank_count as f64) * 0.3;
+                                let combined = rank_base * 0.4 + llm_score * 0.6;
+                                (i, combined)
+                            })
+                            .collect();
+                        top_with_scores.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+
+                        let mut reranked: Vec<String> = top_with_scores
+                            .iter()
+                            .map(|(idx, _)| candidates[*idx].clone())
+                            .collect();
+                        reranked.extend(candidates[rerank_count..].iter().cloned());
+
+                        log::debug!(
+                            "LLM rerank segment '{}': top='{}'",
+                            reading,
+                            reranked[0],
+                        );
+
+                        preceding_text.push_str(&reranked[0]);
+                        reranked_segments.push(reranked);
+                    } else {
+                        preceding_text.push_str(&candidates[0]);
+                        reranked_segments.push(candidates.clone());
+                    }
+                }
+
+                reranked_segments
+            }));
+
+            match result {
+                Ok(reranked) => {
+                    *result_slot.lock().unwrap() = Some(reranked);
+                    log::info!("LLM background reranking complete");
+                }
+                Err(_) => {
+                    log::warn!("LLM background reranking panicked, discarding results");
+                }
+            }
+        });
+    }
+
+    /// Apply LLM reranking results if available.
+    /// Returns true if candidates were updated.
+    pub fn apply_llm_rerank(&mut self) -> bool {
+        let reranked = {
+            let mut slot = self.llm_rerank_result.lock().unwrap();
+            slot.take()
+        };
+
+        let reranked = match reranked {
+            Some(r) => r,
+            None => return false,
+        };
+
+        let state = match self.conversion.as_mut() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let mut updated = false;
+        for (seg, new_candidates) in state.segments.iter_mut().zip(reranked.into_iter()) {
+            // Don't override if user already manually selected a candidate
+            if seg.user_selected {
+                continue;
+            }
+            if seg.candidates != new_candidates {
+                seg.candidates = new_candidates;
+                seg.selected = 0;
+                updated = true;
+            }
+        }
+        if updated {
+            log::info!("LLM reranking applied to conversion state");
+        }
+        updated
+    }
+
+    /// Check if LLM reranking results are ready (non-blocking).
+    pub fn has_llm_rerank_result(&self) -> bool {
+        self.llm_rerank_result.lock().unwrap().is_some()
+    }
+
+    /// Compute effective score combining dictionary frequency, user learning,
+    /// and surface-form adjustments.
     fn effective_score_with(user_scorer: &UserScorer, reading: &str, entry: &DictionaryEntry) -> f64 {
         let freq_norm = (entry.frequency as f64) / 10000.0;
         let user = user_scorer.score(reading, &entry.surface);
-        freq_norm + user * 2.0
+
+        // Surface-form adjustments to correct IPADIC frequency biases
+        let surface_adj = Self::surface_adjustment(reading, &entry.surface, entry.pos);
+
+        freq_norm + user * 2.0 + surface_adj
+    }
+
+    /// Adjustment based on surface form characteristics.
+    /// Returns a bonus (positive) or penalty (negative) added to the effective score.
+    fn surface_adjustment(reading: &str, surface: &str, pos: PartOfSpeech) -> f64 {
+        // Katakana-only surfaces are rarely the desired conversion in normal text.
+        // e.g. イイ(いい), テキ(てき), タイ(たい) — demote significantly.
+        let all_katakana = !surface.is_empty()
+            && surface.chars().all(|c| {
+                ('\u{30A1}'..='\u{30F6}').contains(&c) || c == 'ー'
+            });
+        if all_katakana && surface != reading {
+            return -0.3;
+        }
+
+        // If surface exactly matches reading (kana-only), give a small boost
+        // for functional words — they are often the correct choice.
+        // e.g. これ, それ, いる, する, いい
+        if surface == reading {
+            return match pos {
+                PartOfSpeech::Particle | PartOfSpeech::Auxiliary => 0.2,
+                PartOfSpeech::Verb | PartOfSpeech::Adjective | PartOfSpeech::Adverb => 0.15,
+                PartOfSpeech::Noun => 0.1,  // pronouns are Noun
+                _ => 0.0,
+            };
+        }
+
+        0.0
     }
 
     /// Re-lookup candidates for a segment after its reading changed.
@@ -566,11 +770,19 @@ impl ConversionEngine {
             let score_b = Self::effective_score_with(&user_scorer, &reading, b);
             score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
         });
-        drop(user_scorer);
         let mut candidates: Vec<String> = entries.iter().map(|e| e.surface.clone()).collect();
         if candidates.is_empty() || !candidates.contains(&reading) {
-            candidates.push(reading);
+            let kana_user = user_scorer.score(&reading, &reading);
+            let kana_score = kana_user * 2.0 + 0.1;
+            let insert_pos = entries
+                .iter()
+                .position(|e| {
+                    Self::effective_score_with(&user_scorer, &reading, e) < kana_score
+                })
+                .unwrap_or(candidates.len());
+            candidates.insert(insert_pos, reading);
         }
+        drop(user_scorer);
         if let Some(state) = self.conversion.as_mut() {
             state.segments[idx].candidates = candidates;
             state.segments[idx].selected = 0;
