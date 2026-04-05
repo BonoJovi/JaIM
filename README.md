@@ -7,6 +7,7 @@
 [![Version](https://img.shields.io/badge/Version-1.1.1-blue)](https://github.com/BonoJovi/JaIM/releases)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/bonojovi)
 
 **LLM 駆動の次世代日本語入力 for Linux**
 
@@ -235,3 +236,5 @@ cargo test
 ## ライセンス
 
 [MIT](LICENSE) - Copyright (c) 2026 Yoshihiro NAKAHARA
+
+[![Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/bonojovi)
