@@ -1,5 +1,16 @@
 # JaIM - Japanese AI-powered Input Method
 
+> ## 📢 JaIM は **Bonolith** に名称変更しました
+>
+> このプロジェクトは **[Bonolith](https://github.com/BonoJovi/Bonolith)** として開発を継続しています。
+> 最新版・今後の更新・サポート・ドキュメントはすべて Bonolith をご利用ください。
+>
+> 👉 **新リポジトリ: https://github.com/BonoJovi/Bonolith**
+>
+> 既存の JaIM ユーザーの方は Bonolith への移行を推奨します。以下は JaIM 時点のアーカイブ情報です。
+
+---
+
 <div align="center">
 
 **Japanese Input Method / Japanese a Input Method / Japanese AI Method**
